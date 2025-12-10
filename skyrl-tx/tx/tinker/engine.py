@@ -36,7 +36,7 @@ from tx.utils.models import (
     round_up_seq_len,
     resolve_model_path,
 )
-from tx.layers.lora import update_adapter_config
+# update_adapter_config removed - single adapter mode
 from tx.utils.log import logger
 
 
@@ -134,7 +134,6 @@ class TinkerEngine:
         base_config = PretrainedConfig.from_pretrained(checkpoint_path)
         self.model_config = Qwen3Config(
             base_config,
-            max_lora_adapters=self.config.max_lora_adapters,
             max_lora_rank=self.config.max_lora_rank,
             shard_attention_heads=self.config.shard_attention_heads,
             mlp_lora=self.config.mlp_lora,
@@ -152,7 +151,6 @@ class TinkerEngine:
 
             # Split model into LoRA and non-LoRA parameters
             self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, self.model.is_lora_param, ...)
-            update_adapter_config(self.model, adapter_index=0, lora_config=types.LoraConfig(rank=1, alpha=1.0))
 
             # Initialize global accumulated gradients
             self.accumulated_grads = AccumulatedGradients.create(self.lora_params, self.config.max_lora_adapters)
@@ -504,9 +502,6 @@ class TinkerEngine:
             # These values are always overridden by the hyperparams in the optim_step request.
             tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.0)
             self.optimizers[model_id] = nnx.Optimizer(self.model, tx, wrt=self.model.is_lora_param)
-
-        # Update the adapter's rank and scaling in all LoRA layers
-        update_adapter_config(self.model, adapter_index, lora_config)
 
         logger.info(f"Created LoRA model {model_id} with adapter index {adapter_index}, config {lora_config}")
 

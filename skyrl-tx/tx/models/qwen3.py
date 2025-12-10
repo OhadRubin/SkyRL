@@ -1,9 +1,10 @@
 from flax import nnx
+from flax.nnx.nn.lora import LoRALinear, LoRAParam
 import jax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
 
-from tx.layers.lora import LoRAExpert, LoRALinear, LoRAEmbed
+from tx.layers.lora import LoRAEmbed
 from tx.layers.util import Param, prepare_routing
 from tx.models.configs import Qwen3Config
 from tx.models.types import CausalLMOutput, ModelOutput
@@ -45,12 +46,11 @@ class Qwen3Attention(nnx.Module):
         tp_shard = "tp" if shard_attention_heads else None
         self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
 
-        attn_lora_adapters = config.max_lora_adapters if getattr(config, "attn_lora", True) else 0
+        lora_rank = config.lora_rank if getattr(config, "attn_lora", True) else 0
         self.q_proj = LoRALinear(
             in_features=config.hidden_size,
             out_features=self.num_heads * self.head_dim,
-            max_lora_adapters=attn_lora_adapters,
-            max_lora_rank=config.max_lora_rank,
+            lora_rank=lora_rank,
             dtype=dtype,
             param_dtype=dtype,
             use_bias=False,
@@ -60,8 +60,7 @@ class Qwen3Attention(nnx.Module):
         self.k_proj = LoRALinear(
             in_features=config.hidden_size,
             out_features=self.num_kv_heads * self.head_dim,
-            max_lora_adapters=attn_lora_adapters,
-            max_lora_rank=config.max_lora_rank,
+            lora_rank=lora_rank,
             dtype=dtype,
             param_dtype=dtype,
             use_bias=False,
@@ -71,8 +70,7 @@ class Qwen3Attention(nnx.Module):
         self.v_proj = LoRALinear(
             in_features=config.hidden_size,
             out_features=self.num_kv_heads * self.head_dim,
-            max_lora_adapters=attn_lora_adapters,
-            max_lora_rank=config.max_lora_rank,
+            lora_rank=lora_rank,
             dtype=dtype,
             param_dtype=dtype,
             use_bias=False,
@@ -82,8 +80,7 @@ class Qwen3Attention(nnx.Module):
         self.o_proj = LoRALinear(
             in_features=self.num_heads * self.head_dim,
             out_features=config.hidden_size,
-            max_lora_adapters=attn_lora_adapters,
-            max_lora_rank=config.max_lora_rank,
+            lora_rank=lora_rank,
             dtype=dtype,
             param_dtype=dtype,
             use_bias=False,
@@ -100,15 +97,14 @@ class Qwen3Attention(nnx.Module):
         *,
         attention_mask: jax.Array,
         positions: jax.Array,
-        adapter_indices: jax.Array | None = None,
         kv_cache: tuple[jax.Array, jax.Array, int] | None = None,
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
         B, T, _ = x.shape
 
         # Project and reshape to [B, T, num_heads, head_dim]
-        q = self.q_norm(self.q_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_heads, self.head_dim))
-        k = self.k_norm(self.k_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim))
-        v = self.v_proj(x, adapter_indices=adapter_indices).reshape(B, T, self.num_kv_heads, self.head_dim)
+        q = self.q_norm(self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim))
+        k = self.k_norm(self.k_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim))
+        v = self.v_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim)
 
         # Apply RoPE
         q = apply_rope(q, positions, self.head_dim, self.config.rope_theta)
@@ -133,13 +129,13 @@ class Qwen3Attention(nnx.Module):
         )
 
         output = attn_output.reshape(B, T, self.num_heads * self.head_dim)
-        return self.o_proj(output, adapter_indices=adapter_indices), updated_cache
+        return self.o_proj(output), updated_cache
 
 
 class Qwen3MLP(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
-        mlp_lora_adapters = config.max_lora_adapters if getattr(config, "mlp_lora", True) else 0
+        lora_rank = config.lora_rank if getattr(config, "mlp_lora", True) else 0
         self.gate_proj = LoRALinear(
             config.hidden_size,
             config.intermediate_size,
@@ -147,8 +143,7 @@ class Qwen3MLP(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
             kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
-            max_lora_adapters=mlp_lora_adapters,
-            max_lora_rank=config.max_lora_rank,
+            lora_rank=lora_rank,
             rngs=rngs,
         )
         self.up_proj = LoRALinear(
@@ -158,8 +153,7 @@ class Qwen3MLP(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
             kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
-            max_lora_adapters=mlp_lora_adapters,
-            max_lora_rank=config.max_lora_rank,
+            lora_rank=lora_rank,
             rngs=rngs,
         )
         self.down_proj = LoRALinear(
@@ -169,56 +163,38 @@ class Qwen3MLP(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
             kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("tp", None)),
-            max_lora_adapters=mlp_lora_adapters,
-            max_lora_rank=config.max_lora_rank,
+            lora_rank=lora_rank,
             rngs=rngs,
         )
 
-    def __call__(self, x: jax.Array, adapter_indices: jax.Array | None = None) -> jax.Array:
-        gate_out = self.gate_proj(x, adapter_indices)
-        up_out = self.up_proj(x, adapter_indices)
-        return self.down_proj(nnx.silu(gate_out) * up_out, adapter_indices)
+    def __call__(self, x: jax.Array) -> jax.Array:
+        gate_out = self.gate_proj(x)
+        up_out = self.up_proj(x)
+        return self.down_proj(nnx.silu(gate_out) * up_out)
 
 
 class Qwen3Experts(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
-        mlp_lora_adapters = config.max_lora_adapters if getattr(config, "mlp_lora", True) else 0
-        self.gate_proj = LoRAExpert(
-            config.num_experts,
-            config.hidden_size,
-            config.moe_intermediate_size,
-            max_lora_adapters=mlp_lora_adapters,
-            max_lora_rank=config.max_lora_rank,
-            dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp")),
-            rngs=rngs,
+        # MoE experts use regular Linear layers (no LoRA for now in single-adapter mode)
+        self.gate_proj = nnx.Param(
+            nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp"))(
+                rngs.params(), (config.num_experts, config.hidden_size, config.moe_intermediate_size), dtype
+            )
         )
-        self.up_proj = LoRAExpert(
-            config.num_experts,
-            config.hidden_size,
-            config.moe_intermediate_size,
-            max_lora_adapters=mlp_lora_adapters,
-            max_lora_rank=config.max_lora_rank,
-            dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp")),
-            rngs=rngs,
+        self.up_proj = nnx.Param(
+            nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp"))(
+                rngs.params(), (config.num_experts, config.hidden_size, config.moe_intermediate_size), dtype
+            )
         )
-        self.down_proj = LoRAExpert(
-            config.num_experts,
-            config.moe_intermediate_size,
-            config.hidden_size,
-            max_lora_adapters=mlp_lora_adapters,
-            max_lora_rank=config.max_lora_rank,
-            dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", None)),
-            rngs=rngs,
+        self.down_proj = nnx.Param(
+            nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", None))(
+                rngs.params(), (config.num_experts, config.moe_intermediate_size, config.hidden_size), dtype
+            )
         )
 
-    def __call__(
-        self, hidden_states: jax.Array, router_logits: jax.Array, adapter_indices: jax.Array | None = None
-    ) -> jax.Array:
+    def __call__(self, hidden_states: jax.Array, router_logits: jax.Array) -> jax.Array:
         # Get top-k experts for each token and compute routing weights
         routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
         routing_weights = nnx.softmax(routing_weights, axis=-1)
@@ -226,20 +202,16 @@ class Qwen3Experts(nnx.Module):
         # Prepare for ragged_dot by sorting tokens based on their assigned expert
         selected_experts_flat = selected_experts.ravel()
         hidden_states_expanded = jnp.repeat(hidden_states, self.config.num_experts_per_tok, axis=0)
-        adapter_indices_expanded = (
-            jnp.repeat(adapter_indices, self.config.num_experts_per_tok) if adapter_indices is not None else None
-        )
-        hidden_states_sorted, group_sizes, unsort_indices, adapter_indices_sorted = prepare_routing(
+        hidden_states_sorted, group_sizes, unsort_indices, _ = prepare_routing(
             hidden_states_expanded,
             selected_experts_flat,
             self.config.num_experts,
-            adapter_indices=adapter_indices_expanded,
         )
 
-        # Apply expert layers using LoRAExpert
-        gate_out = self.gate_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
-        up_out = self.up_proj(hidden_states_sorted, group_sizes, adapter_indices_sorted)
-        down_out = self.down_proj(nnx.silu(gate_out) * up_out, group_sizes, adapter_indices_sorted)
+        # Apply expert layers using ragged_dot
+        gate_out = jax.lax.ragged_dot(hidden_states_sorted, self.gate_proj.value, group_sizes)
+        up_out = jax.lax.ragged_dot(hidden_states_sorted, self.up_proj.value, group_sizes)
+        down_out = jax.lax.ragged_dot(nnx.silu(gate_out) * up_out, self.down_proj.value, group_sizes)
 
         # Unsort and combine the expert outputs
         unsorted_out = down_out[unsort_indices]
@@ -266,17 +238,13 @@ class Qwen3MoeSparseMoeBlock(nnx.Module):
         self,
         hidden_states: jax.Array,
         *,
-        adapter_indices: jax.Array | None = None,
         return_router_logits: bool = False,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
         (batch_size, seq_len, hidden_size) = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_size)
-        # Expand adapter_indices to match flattened hidden_states
-        if adapter_indices is not None:
-            adapter_indices = jnp.repeat(adapter_indices, seq_len)
         router_logits = self.gate(hidden_states)
 
-        hidden_states = self.experts(hidden_states, router_logits, adapter_indices)
+        hidden_states = self.experts(hidden_states, router_logits)
         hidden_states = hidden_states.reshape(batch_size, seq_len, hidden_size)
 
         if return_router_logits:
@@ -301,7 +269,6 @@ class Qwen3DecoderLayer(nnx.Module):
         *,
         attention_mask: jax.Array,
         positions: jax.Array,
-        adapter_indices: jax.Array | None = None,
         kv_cache: tuple[jax.Array, jax.Array, int] | None = None,
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
         residual = hidden_states
@@ -310,14 +277,13 @@ class Qwen3DecoderLayer(nnx.Module):
             hidden_states,
             attention_mask=attention_mask,
             positions=positions,
-            adapter_indices=adapter_indices,
             kv_cache=kv_cache,
         )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        mlp_output = self.mlp(hidden_states, adapter_indices=adapter_indices)
+        mlp_output = self.mlp(hidden_states)
         hidden_states = residual + mlp_output
 
         return hidden_states, updated_cache
@@ -328,12 +294,12 @@ class Qwen3Model(nnx.Module):
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs, mesh=None) -> None:
         self.config = config
 
+        lora_rank = config.lora_rank
         self.embed_tokens = LoRAEmbed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             dtype=dtype,
-            max_lora_adapters=config.max_lora_adapters,
-            max_lora_rank=config.max_lora_rank,
+            lora_rank=lora_rank,
             param_dtype=dtype,
             embedding_init=nnx.with_partitioning(nnx.initializers.normal(), ("tp", None)),
             rngs=rngs,
@@ -379,14 +345,13 @@ class Qwen3Model(nnx.Module):
         attention_mask: jax.Array,
         positions: jax.Array,
         output_hidden_states: bool | None = None,
-        adapter_indices: jax.Array | None = None,
         kv_cache: KVCache | None = None,
     ) -> ModelOutput:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        hidden_states = self.embed_tokens(input_ids, adapter_indices=adapter_indices)
+        hidden_states = self.embed_tokens(input_ids)
         all_hidden_states: list[jax.Array] = []
 
         if getattr(self.config, "scan_layers", False):
@@ -403,23 +368,22 @@ class Qwen3Model(nnx.Module):
                 layer_state_axes = nnx.StateAxes({...: 0})
 
                 @nnx.scan(
-                    in_axes=(layer_state_axes, nnx.Carry, None, None, None, 0, 0),
+                    in_axes=(layer_state_axes, nnx.Carry, None, None, 0, 0),
                     out_axes=(nnx.Carry, (0, 0)),
                     length=num_layers,  # Explicit length helps XLA recognize this as a loop
                     transform_metadata={nnx.PARTITION_NAME: None},
                 )
-                def apply_layer_with_cache(layer, h, attn_mask, pos, adapter_idx, k_cache, v_cache):
+                def apply_layer_with_cache(layer, h, attn_mask, pos, k_cache, v_cache):
                     h, (k, v) = layer(
                         h,
                         attention_mask=attn_mask,
                         positions=pos,
-                        adapter_indices=adapter_idx,
                         kv_cache=(k_cache, v_cache, cache_position),
                     )
                     return h, (k, v)
 
                 hidden_states, (updated_keys, updated_values) = apply_layer_with_cache(
-                    self.layers, hidden_states, attention_mask, positions, adapter_indices,
+                    self.layers, hidden_states, attention_mask, positions,
                     stacked_keys, stacked_values
                 )
             else:
@@ -428,23 +392,22 @@ class Qwen3Model(nnx.Module):
                 layer_state_axes = nnx.StateAxes({...: 0})
 
                 @nnx.scan(
-                    in_axes=(layer_state_axes, nnx.Carry, None, None, None),
+                    in_axes=(layer_state_axes, nnx.Carry, None, None),
                     out_axes=(nnx.Carry, (0, 0)),
                     length=num_layers,  # Explicit length helps XLA recognize this as a loop
                     transform_metadata={nnx.PARTITION_NAME: None},
                 )
-                def apply_layer_no_cache(layer, h, attn_mask, pos, adapter_idx):
+                def apply_layer_no_cache(layer, h, attn_mask, pos):
                     h, (k, v) = layer(
                         h,
                         attention_mask=attn_mask,
                         positions=pos,
-                        adapter_indices=adapter_idx,
                         kv_cache=None,
                     )
                     return h, (k, v)
 
                 hidden_states, (updated_keys, updated_values) = apply_layer_no_cache(
-                    self.layers, hidden_states, attention_mask, positions, adapter_indices
+                    self.layers, hidden_states, attention_mask, positions
                 )
 
             # Convert stacked arrays to lists for KVCache
@@ -463,7 +426,6 @@ class Qwen3Model(nnx.Module):
                     hidden_states,
                     attention_mask=attention_mask,
                     positions=positions,
-                    adapter_indices=adapter_indices,
                     kv_cache=kv_cache and (kv_cache.keys[layer_idx], kv_cache.values[layer_idx], kv_cache.cache_position),
                 )
                 updated_keys.append(k)
@@ -489,6 +451,7 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
         self.config = config
         self.model = Qwen3Model(config, dtype=dtype, rngs=rngs, mesh=mesh)
         if not self.config.tie_word_embeddings:
+            lora_rank = config.lora_rank
             self.lm_head = LoRALinear(
                 config.hidden_size,
                 config.vocab_size,
@@ -496,15 +459,14 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
                 dtype=dtype,
                 param_dtype=dtype,
                 kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
-                max_lora_adapters=config.max_lora_adapters,
-                max_lora_rank=config.max_lora_rank,
+                lora_rank=lora_rank,
                 rngs=rngs,
             )
 
     @staticmethod
     def is_lora_param(path: tuple, _value) -> bool:
         """Return True if a parameter path corresponds to LoRA weights."""
-        return any(name in path for name in ("lora_A", "lora_B"))
+        return any(name in path for name in ("lora_a", "lora_b", "lora"))
 
     def __call__(
         self,
@@ -513,7 +475,6 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
         attention_mask: jax.Array,
         positions: jax.Array | None = None,
         output_hidden_states: bool | None = None,
-        adapter_indices: jax.Array | None = None,
         kv_cache: KVCache | None = None,
     ) -> CausalLMOutput:
         if positions is None:
@@ -524,14 +485,13 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
             attention_mask=attention_mask,
             positions=positions,
             output_hidden_states=output_hidden_states,
-            adapter_indices=adapter_indices,
             kv_cache=kv_cache,
         )
         hidden_states = outputs.last_hidden_state
         if self.config.tie_word_embeddings:
             logits = hidden_states @ self.model.embed_tokens.embedding.value.T
         else:
-            logits = self.lm_head(hidden_states, adapter_indices=adapter_indices)
+            logits = self.lm_head(hidden_states)
 
         return CausalLMOutput(
             logits=logits,

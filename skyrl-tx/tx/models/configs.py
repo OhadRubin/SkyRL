@@ -7,12 +7,11 @@ class Qwen3Config(PretrainedConfig):
     """Qwen3 configuration for tx.
 
     Wraps a HuggingFace PretrainedConfig with additional parameters
-    for Multi-LoRA training and tensor parallelism.
+    for LoRA training and tensor parallelism.
 
     Args:
         config: A HuggingFace PretrainedConfig object (e.g., from Qwen3Config.from_pretrained())
-        max_lora_adapters: Maximum number of concurrent LoRA adapters
-        max_lora_rank: Maximum rank for LoRA adapters
+        lora_rank: Rank for LoRA adapters (0 to disable LoRA)
         shard_attention_heads: Whether to shard attention across tensor parallel devices
         mlp_lora: Whether to enable LoRA for MLP layers
         attn_lora: Whether to enable LoRA for attention layers
@@ -20,8 +19,7 @@ class Qwen3Config(PretrainedConfig):
     """
 
     # Type hints for LoRA attributes
-    max_lora_adapters: int
-    max_lora_rank: int
+    lora_rank: int
     shard_attention_heads: bool
     mlp_lora: bool
     attn_lora: bool
@@ -31,9 +29,8 @@ class Qwen3Config(PretrainedConfig):
         self,
         config: PretrainedConfig,
         *,
-        max_lora_adapters: int,
-        max_lora_rank: int,
-        shard_attention_heads: bool,
+        max_lora_rank: int = 0,
+        shard_attention_heads: bool = True,
         mlp_lora: bool = True,
         attn_lora: bool = True,
         scan_layers: bool = False,
@@ -41,9 +38,8 @@ class Qwen3Config(PretrainedConfig):
         # Copy all attributes from the base config
         super().__init__(**config.to_dict())
 
-        # Add LoRA-specific parameters
-        self.max_lora_adapters = max_lora_adapters
-        self.max_lora_rank = max_lora_rank
+        # Add LoRA-specific parameters (max_lora_rank maps to lora_rank for NNX LoRA)
+        self.lora_rank = max_lora_rank
         self.shard_attention_heads = shard_attention_heads
         self.mlp_lora = mlp_lora
         self.attn_lora = attn_lora
