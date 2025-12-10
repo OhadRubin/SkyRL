@@ -73,41 +73,38 @@ def pad_batch(sequences: list[list], max_length: int, dtype, left: bool = False)
 @jax.tree_util.register_dataclass
 @dataclass
 class AccumulatedGradients:
-    """Stores accumulated gradients for all LoRA adapters."""
+    """Stores accumulated gradients."""
 
     grad_sum: nnx.State
-    counts: jax.Array
+    count: jax.Array
 
     @classmethod
-    def create(cls, lora_params: nnx.State, max_adapters: int) -> "AccumulatedGradients":
+    def create(cls, lora_params: nnx.State) -> "AccumulatedGradients":
         """Initialize with zeros."""
         return cls(
             grad_sum=jax.tree.map(jnp.zeros_like, lora_params),
-            counts=jnp.zeros((max_adapters,), dtype=jnp.int32),
+            count=jnp.zeros((1,), dtype=jnp.int32),
         )
 
-    def add(self, lora_grads: nnx.State, adapter_indices: jax.Array) -> "AccumulatedGradients":
-        """Accumulate gradients and increment counts."""
-        # Count occurrences of each adapter index in the batch
-        batch_counts = jnp.bincount(adapter_indices, length=self.counts.shape[0])
+    def add(self, lora_grads: nnx.State, batch_size: int) -> "AccumulatedGradients":
+        """Accumulate gradients and increment count."""
         return AccumulatedGradients(
             grad_sum=jax.tree.map(lambda a, b: a + b, self.grad_sum, lora_grads),
-            counts=self.counts + batch_counts,
+            count=self.count + batch_size,
         )
 
-    def get_mean(self, adapter_index: jax.Array) -> nnx.State:
-        """Compute mean gradients for a specific adapter, with zeros for all other adapters."""
-        count = self.counts[adapter_index]
+    def get_mean(self) -> nnx.State:
+        """Compute mean gradients."""
         return jax.tree.map(
-            lambda g: jnp.zeros_like(g).at[adapter_index].set(g[adapter_index] / count.astype(g.dtype)),
+            lambda g: g / self.count.astype(g.dtype),
             self.grad_sum,
         )
 
-    def reset_adapter(self, adapter_index: jax.Array) -> "AccumulatedGradients":
-        """Reset gradients and count for a specific adapter."""
+    def reset(self) -> "AccumulatedGradients":
+        """Reset gradients and count."""
         return AccumulatedGradients(
-            grad_sum=jax.tree.map(lambda g: g.at[adapter_index].set(0.0), self.grad_sum),
-            counts=self.counts.at[adapter_index].set(0),
+            grad_sum=jax.tree.map(jnp.zeros_like, self.grad_sum),
+            count=jnp.zeros((1,), dtype=jnp.int32),
         )
 
 
@@ -153,7 +150,7 @@ class TinkerEngine:
             self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, self.model.is_lora_param, ...)
 
             # Initialize global accumulated gradients
-            self.accumulated_grads = AccumulatedGradients.create(self.lora_params, self.config.max_lora_adapters)
+            self.accumulated_grads = AccumulatedGradients.create(self.lora_params)
 
         logger.info(
             f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
@@ -292,7 +289,8 @@ class TinkerEngine:
                 advantages,
             )
             # Accumulate gradients
-            new_accumulated_grads = accumulated_grads.add(lora_grads, adapter_indices)
+            batch_size = input_ids.shape[0]
+            new_accumulated_grads = accumulated_grads.add(lora_grads, batch_size)
             return new_accumulated_grads, per_token_losses, target_logprobs, loss
 
         if self.config.enforce_eager:
@@ -331,8 +329,8 @@ class TinkerEngine:
             adapter_index: jax.Array,
         ) -> AccumulatedGradients:
             """Compute full gradients, apply optimizer update, and reset accumulated grads."""
-            optimizer.update(lora_params, accumulated_grads.get_mean(adapter_index))
-            return accumulated_grads.reset_adapter(adapter_index)
+            optimizer.update(lora_params, accumulated_grads.get_mean())
+            return accumulated_grads.reset()
 
         if self.config.enforce_eager:
             self._compute_grads_and_update = compute_grads_and_update
@@ -746,7 +744,7 @@ class TinkerEngine:
         adapter_index = jnp.int32(self.models[model_id].adapter_index)
 
         # Check if we have any gradients accumulated (count > 0)
-        if self.accumulated_grads.counts[adapter_index] == 0:
+        if self.accumulated_grads.count[0] == 0:
             logger.warning(f"No accumulated gradients for model {model_id}, skipping optimizer step")
             return types.OptimStepOutput()
 
