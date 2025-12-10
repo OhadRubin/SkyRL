@@ -114,6 +114,9 @@ def get_expert_key(path: tuple, expert_idx: int, layer_idx: int | None = None) -
     """
     if path[-1] in {"embedding", "kernel"}:
         path = (*path[:-1], "weight")
+    else:
+        # For nnx.Param directly on module, append weight
+        path = (*path, "weight")
     path = tuple(s if s != "experts" else f"experts.{expert_idx}" for s in path)
 
     if layer_idx is not None and "layers" in path:
