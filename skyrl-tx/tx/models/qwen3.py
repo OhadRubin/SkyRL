@@ -130,7 +130,7 @@ class Qwen3Attention(nnx.Module):
             and self.mesh is not None
             and kv_cache is None  # Ring attention only for training, not inference
         )
-        use_ring = False  # Disabled - ringattention has block_q issues with short sequences
+        use_ring = True
 
         if use_ring:
             # Ring attention path - uses [B, T, num_heads, head_dim] layout
@@ -165,6 +165,8 @@ class Qwen3Attention(nnx.Module):
                         attn_pdrop=0.0,
                         query_chunk_size=self.config.scan_query_chunk_size,
                         key_chunk_size=self.config.scan_key_chunk_size,
+                        block_q=self.config.scan_query_chunk_size,
+                        block_k=self.config.scan_key_chunk_size,
                         dtype=x.dtype,
                         policy=jax.checkpoint_policies.nothing_saveable,
                         precision=None,
