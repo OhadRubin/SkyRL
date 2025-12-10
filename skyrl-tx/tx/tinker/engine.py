@@ -210,7 +210,7 @@ class TinkerEngine:
             adapter_indices: jax.Array,
         ) -> jax.Array:
             model = nnx.merge(graphdef, lora_params, non_lora_params)
-            output = model(input_ids, attention_mask=attention_mask, adapter_indices=adapter_indices)
+            output = model(input_ids, attention_mask=attention_mask)
             return output.logits
 
         if self.config.gradient_checkpointing:
