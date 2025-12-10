@@ -1,3 +1,5 @@
+import math
+
 from flax import nnx
 from flax.nnx.nn.lora import LoRALinear, LoRAParam
 import jax
@@ -131,12 +133,13 @@ class Qwen3Attention(nnx.Module):
             v = jnp.repeat(v, n_rep, axis=1)  # [B, num_heads, T, head_dim]
 
         # Use Pallas flash attention (memory-efficient, no materialized attention matrix)
+        # sm_scale must be a static Python float, not a JAX tracer
         attn_output = flash_attention(
             q,
             k,
             v,
             causal=kv_cache is None,
-            sm_scale=1.0 / jnp.sqrt(jnp.float32(self.head_dim)),
+            sm_scale=1.0 / math.sqrt(self.head_dim),
         )  # [B, num_heads, T, head_dim]
 
         # Transpose back to [B, T, num_heads, head_dim] and reshape
