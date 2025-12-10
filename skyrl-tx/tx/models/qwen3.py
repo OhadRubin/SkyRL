@@ -165,8 +165,6 @@ class Qwen3Attention(nnx.Module):
                         attn_pdrop=0.0,
                         query_chunk_size=self.config.scan_query_chunk_size,
                         key_chunk_size=self.config.scan_key_chunk_size,
-                        block_q=self.config.scan_query_chunk_size,
-                        block_k=self.config.scan_key_chunk_size,
                         dtype=x.dtype,
                         policy=jax.checkpoint_policies.nothing_saveable,
                         precision=None,

@@ -74,11 +74,11 @@ class EngineConfig(BaseModel):
         description="Use ring attention for distributed sequence parallelism (requires sequence_parallel_size > 1)",
     )
     scan_query_chunk_size: int = Field(
-        default=1024,
+        default=512,
         description="Query chunk size for blockwise/ring attention",
     )
     scan_key_chunk_size: int = Field(
-        default=1024,
+        default=512,
         description="Key/value chunk size for blockwise/ring attention",
     )
 
