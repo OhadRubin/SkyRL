@@ -322,7 +322,7 @@ class Qwen3DecoderLayer(nnx.Module):
 
 class Qwen3Model(nnx.Module):
 
-    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs, mesh=None) -> None:
         self.config = config
 
         self.embed_tokens = LoRAEmbed(
@@ -335,9 +335,38 @@ class Qwen3Model(nnx.Module):
             embedding_init=nnx.with_partitioning(nnx.initializers.normal(), ("tp", None)),
             rngs=rngs,
         )
-        self.layers = nnx.List(
-            [Qwen3DecoderLayer(config, dtype=dtype, rngs=rngs) for _ in range(config.num_hidden_layers)]
-        )
+
+        if getattr(config, "scan_layers", False):
+            # Use nnx.vmap to create stacked layers, then nnx.scan for forward pass
+            # All state is stacked on axis 0
+
+            # Pre-split keys outside eval_shape to avoid RNG mutation in traced context
+            keys = jax.random.split(rngs.params(), config.num_hidden_layers)
+
+            @nnx.vmap(
+                in_axes=(None, None, 0),  # keys vectorized on axis 0
+                out_axes=0,  # All module state stacked on axis 0
+                transform_metadata={nnx.PARTITION_NAME: None},  # Layer axis not sharded
+            )
+            def create_layer(cfg, dt, key):
+                return Qwen3DecoderLayer(cfg, dtype=dt, rngs=nnx.Rngs(key))
+
+            if mesh is None:
+                raise ValueError("mesh must be provided when scan_layers=True to enable sharded initialization")
+
+            # Use jax.jit with mesh context to create sharded layers directly
+            # JAX will optimize away intermediate allocations and create sharded arrays
+            @jax.jit
+            def create_layers():
+                return create_layer(config, dtype, keys)
+
+            with jax.set_mesh(mesh):
+                self.layers = create_layers()
+        else:
+            self.layers = nnx.List(
+                [Qwen3DecoderLayer(config, dtype=dtype, rngs=rngs) for _ in range(config.num_hidden_layers)]
+            )
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
 
     def __call__(
@@ -356,21 +385,86 @@ class Qwen3Model(nnx.Module):
 
         hidden_states = self.embed_tokens(input_ids, adapter_indices=adapter_indices)
         all_hidden_states: list[jax.Array] = []
-        updated_keys, updated_values = [], []
 
-        for layer_idx, layer in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states.append(hidden_states)
+        if getattr(self.config, "scan_layers", False):
+            # Use nnx.scan which handles state propagation and gradient flow correctly
+            # Unlike jax.lax.scan + manual split/merge, nnx.scan preserves gradient paths
+            num_layers = self.config.num_hidden_layers
 
-            hidden_states, (k, v) = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                positions=positions,
-                adapter_indices=adapter_indices,
-                kv_cache=kv_cache and (kv_cache.keys[layer_idx], kv_cache.values[layer_idx], kv_cache.cache_position),
-            )
-            updated_keys.append(k)
-            updated_values.append(v)
+            if kv_cache is not None:
+                stacked_keys = jnp.stack(kv_cache.keys, axis=0)
+                stacked_values = jnp.stack(kv_cache.values, axis=0)
+                cache_position = kv_cache.cache_position
+
+                # Use StateAxes with ellipsis to scan ALL state types over axis 0
+                layer_state_axes = nnx.StateAxes({...: 0})
+
+                @nnx.scan(
+                    in_axes=(layer_state_axes, nnx.Carry, None, None, None, 0, 0),
+                    out_axes=(nnx.Carry, (0, 0)),
+                    length=num_layers,  # Explicit length helps XLA recognize this as a loop
+                    transform_metadata={nnx.PARTITION_NAME: None},
+                )
+                def apply_layer_with_cache(layer, h, attn_mask, pos, adapter_idx, k_cache, v_cache):
+                    h, (k, v) = layer(
+                        h,
+                        attention_mask=attn_mask,
+                        positions=pos,
+                        adapter_indices=adapter_idx,
+                        kv_cache=(k_cache, v_cache, cache_position),
+                    )
+                    return h, (k, v)
+
+                hidden_states, (updated_keys, updated_values) = apply_layer_with_cache(
+                    self.layers, hidden_states, attention_mask, positions, adapter_indices,
+                    stacked_keys, stacked_values
+                )
+            else:
+                # Use StateAxes with ellipsis to scan ALL state types over axis 0
+                # This ensures every variable (Param, Variable, etc.) is properly sliced per-layer
+                layer_state_axes = nnx.StateAxes({...: 0})
+
+                @nnx.scan(
+                    in_axes=(layer_state_axes, nnx.Carry, None, None, None),
+                    out_axes=(nnx.Carry, (0, 0)),
+                    length=num_layers,  # Explicit length helps XLA recognize this as a loop
+                    transform_metadata={nnx.PARTITION_NAME: None},
+                )
+                def apply_layer_no_cache(layer, h, attn_mask, pos, adapter_idx):
+                    h, (k, v) = layer(
+                        h,
+                        attention_mask=attn_mask,
+                        positions=pos,
+                        adapter_indices=adapter_idx,
+                        kv_cache=None,
+                    )
+                    return h, (k, v)
+
+                hidden_states, (updated_keys, updated_values) = apply_layer_no_cache(
+                    self.layers, hidden_states, attention_mask, positions, adapter_indices
+                )
+
+            # Convert stacked arrays to lists for KVCache
+            updated_keys = [updated_keys[i] for i in range(num_layers)]
+            updated_values = [updated_values[i] for i in range(num_layers)]
+
+        else:
+            # Original for-loop based forward pass
+            updated_keys, updated_values = [], []
+
+            for layer_idx, layer in enumerate(self.layers):
+                if output_hidden_states:
+                    all_hidden_states.append(hidden_states)
+
+                hidden_states, (k, v) = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    positions=positions,
+                    adapter_indices=adapter_indices,
+                    kv_cache=kv_cache and (kv_cache.keys[layer_idx], kv_cache.values[layer_idx], kv_cache.cache_position),
+                )
+                updated_keys.append(k)
+                updated_values.append(v)
 
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
@@ -388,9 +482,9 @@ class Qwen3Model(nnx.Module):
 
 class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
 
-    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs, mesh=None) -> None:
         self.config = config
-        self.model = Qwen3Model(config, dtype=dtype, rngs=rngs)
+        self.model = Qwen3Model(config, dtype=dtype, rngs=rngs, mesh=mesh)
         if not self.config.tie_word_embeddings:
             self.lm_head = LoRALinear(
                 config.hidden_size,
