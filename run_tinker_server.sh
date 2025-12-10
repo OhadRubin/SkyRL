@@ -62,11 +62,11 @@ PRECOMPILE_SEQ_LENS=""
 sudo rm /tmp/libtpu_lockfile || true
 sleep 2
 # Run the server
+# --gradient-checkpointing \
 uv run --extra tinker --extra tpu  -m tx.tinker.api \
     --checkpoints-base "${CHECKPOINTS_BASE}" \
     ${ADDITIONAL_FLAGS} \
     --base-model "${BASE_MODEL}" \
-    --gradient-checkpointing \
     --tensor-parallel-size ${TENSOR_PARALLEL_SIZE} \
     --max-lora-adapters ${MAX_LORA_ADAPTERS} \
     --no-mlp-lora \
