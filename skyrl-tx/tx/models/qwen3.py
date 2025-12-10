@@ -130,7 +130,8 @@ class Qwen3Attention(nnx.Module):
             and self.mesh is not None
             and kv_cache is None  # Ring attention only for training, not inference
         )
-        use_ring = True
+        use_ring = False
+        use_flash = False
 
         if use_ring:
             # Ring attention path - uses [B, T, num_heads, head_dim] layout
@@ -183,7 +184,7 @@ class Qwen3Attention(nnx.Module):
             )
             attn_output = ring_attention_sharded(q, k, v, attention_bias, None)
             # attn_output: [B, T, num_heads, head_dim]
-        else:
+        elif use_flash:
             # Standard flash attention path
             # Transpose to [B, num_heads, T, head_dim] for flash attention
             q = jnp.transpose(q, (0, 2, 1, 3))  # [B, num_heads, T, head_dim]
@@ -221,6 +222,15 @@ class Qwen3Attention(nnx.Module):
 
             # Transpose back to [B, T, num_heads, head_dim]
             attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))  # [B, T, num_heads, head_dim]
+        else:
+            attn_output = jax.nn.dot_product_attention(
+                q,
+                k,
+                v,
+                scale=1.0 / self.head_dim**0.5,
+                mask=attention_mask[:, None, None, :].astype(bool),
+                is_causal=kv_cache is None,
+            )
 
         output = attn_output.reshape(B, T, self.num_heads * self.head_dim)
         return self.o_proj(output), updated_cache
