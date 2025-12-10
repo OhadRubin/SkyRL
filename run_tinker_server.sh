@@ -16,7 +16,7 @@ export TRANSFORMERS_CACHE=/dev/shm/huggingface_cache
 ADDITIONAL_FLAGS=""
 LOG_FILE="/tmp/tinker-api.log"
 MIN_SEQ_LEN=32
-MIN_SEQ_LEN=8192
+# MIN_SEQ_LEN=8192
 while [[ $# -gt 0 ]]; do
     case $1 in
         --scan-layers)
