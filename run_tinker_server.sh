@@ -64,8 +64,9 @@ sleep 2
 
 # Reinstall ringattention to get clean copy, then fix deprecated JAX API
 uv pip install --reinstall ringattention --quiet
-sed -i 's/jax.lib.xla_bridge.get_backend/jax.extend.backend.get_backend/' /home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/ringattention/__init__.py
-sed -i 's/^import jax$/import jax\nimport jax.extend/' /home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/ringattention/__init__.py
+RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/ringattention/__init__.py"
+sed -i 's/jax.lib.xla_bridge.get_backend/jax.extend.backend.get_backend/' "$RING_INIT"
+sed -i 's/^import jax$/import jax\nimport jax.extend/' "$RING_INIT"
 
 # Run the server
 # --gradient-checkpointing \
