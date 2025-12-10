@@ -68,6 +68,19 @@ class EngineConfig(BaseModel):
         default=32,
         description="Minimum sequence length for padding buckets (sequences shorter than this are padded up to this length)",
     )
+    # Ring attention options
+    use_ring_attention: bool = Field(
+        default=False,
+        description="Use ring attention for distributed sequence parallelism (requires sequence_parallel_size > 1)",
+    )
+    scan_query_chunk_size: int = Field(
+        default=1024,
+        description="Query chunk size for blockwise/ring attention",
+    )
+    scan_key_chunk_size: int = Field(
+        default=1024,
+        description="Key/value chunk size for blockwise/ring attention",
+    )
 
 
 def convert_env_var(env_name: str, env_value: str, expected_type: type):

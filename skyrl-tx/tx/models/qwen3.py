@@ -125,42 +125,104 @@ class Qwen3Attention(nnx.Module):
 
         updated_cache = (k, v)
 
-        # Transpose to [B, num_heads, T, head_dim] for flash attention
-        q = jnp.transpose(q, (0, 2, 1, 3))  # [B, num_heads, T, head_dim]
-        k = jnp.transpose(k, (0, 2, 1, 3))  # [B, num_kv_heads, T, head_dim]
-        v = jnp.transpose(v, (0, 2, 1, 3))  # [B, num_kv_heads, T, head_dim]
+        # Check if we should use ring attention
+        use_ring = (
+            getattr(self.config, "use_ring_attention", False)
+            and self.mesh is not None
+            and kv_cache is None  # Ring attention only for training, not inference
+        )
 
-        # Handle GQA: repeat k/v heads to match num_heads
-        if self.num_kv_heads < self.num_heads:
-            n_rep = self.num_heads // self.num_kv_heads
-            k = jnp.repeat(k, n_rep, axis=1)  # [B, num_heads, T, head_dim]
-            v = jnp.repeat(v, n_rep, axis=1)  # [B, num_heads, T, head_dim]
+        if use_ring:
+            # Ring attention path - uses [B, T, num_heads, head_dim] layout
+            from ringattention import ringattention
 
-        # Use Pallas flash attention wrapped in shard_map
-        # Mosaic kernels cannot be automatically partitioned, so we must use shard_map
-        # Layout: [batch, num_heads, seq_len, head_dim]
-        # Sharding: batch on "dp", heads on "tp" (if shard_attention_heads), seq/head_dim unsharded
-        sm_scale = 1.0 / math.sqrt(self.head_dim)
-        causal = kv_cache is None
+            # Handle GQA: repeat k/v heads to match num_heads (in BTHD layout)
+            if self.num_kv_heads < self.num_heads:
+                n_rep = self.num_heads // self.num_kv_heads
+                k = jnp.repeat(k, n_rep, axis=2)  # [B, T, num_heads, head_dim]
+                v = jnp.repeat(v, n_rep, axis=2)  # [B, T, num_heads, head_dim]
 
-        if self.mesh is not None:
-            # Wrap flash_attention in shard_map for proper SPMD partitioning
-            attn_spec = P("dp", self.tp_shard, None, None)
-            flash_attention_sharded = shard_map(
-                partial(flash_attention, causal=causal, sm_scale=sm_scale),
+            # Transform attention mask to bias: [B, 1, 1, T] -> float mask
+            attention_mask_expanded = jnp.expand_dims(attention_mask, axis=(-3, -2))
+            attention_bias = jax.lax.select(
+                attention_mask_expanded > 0,
+                jnp.zeros_like(attention_mask_expanded, dtype=x.dtype),
+                jnp.full_like(attention_mask_expanded, jnp.finfo(x.dtype).min, dtype=x.dtype),
+            )
+
+            # Wrap ringattention in shard_map - use "tp" axis for sequence parallelism
+            # Ring attention distributes sequence across devices in a ring topology
+            ring_attention_sharded = shard_map(
+                partial(
+                    ringattention,
+                    axis_name="tp",  # Use tp axis for ring communication
+                    float32_logits=True,
+                    cache_idx=None,
+                    blockwise_kwargs=dict(
+                        causal_block_size=1,
+                        deterministic=True,
+                        dropout_rng=None,
+                        attn_pdrop=0.0,
+                        query_chunk_size=self.config.scan_query_chunk_size,
+                        key_chunk_size=self.config.scan_key_chunk_size,
+                        dtype=x.dtype,
+                        policy=jax.checkpoint_policies.nothing_saveable,
+                        precision=None,
+                        prevent_cse=not getattr(self.config, "scan_layers", False),
+                    ),
+                ),
                 mesh=self.mesh,
-                in_specs=(attn_spec, attn_spec, attn_spec),
-                out_specs=attn_spec,
+                in_specs=(
+                    P("dp", "tp", None, None),  # q: [B, T, num_heads, head_dim]
+                    P("dp", "tp", None, None),  # k: [B, T, num_heads, head_dim]
+                    P("dp", "tp", None, None),  # v: [B, T, num_heads, head_dim]
+                    P("dp", None, None, None),  # bias: [B, 1, 1, T]
+                    P("dp", None),              # segment_ids (None)
+                ),
+                out_specs=P("dp", "tp", None, None),
                 check_rep=False,
             )
-            attn_output = flash_attention_sharded(q, k, v)
+            attn_output = ring_attention_sharded(q, k, v, attention_bias, None)
+            # attn_output: [B, T, num_heads, head_dim]
         else:
-            # Fallback without shard_map (e.g., single device)
-            attn_output = flash_attention(q, k, v, causal=causal, sm_scale=sm_scale)
-        # attn_output: [B, num_heads, T, head_dim]
+            # Standard flash attention path
+            # Transpose to [B, num_heads, T, head_dim] for flash attention
+            q = jnp.transpose(q, (0, 2, 1, 3))  # [B, num_heads, T, head_dim]
+            k = jnp.transpose(k, (0, 2, 1, 3))  # [B, num_kv_heads, T, head_dim]
+            v = jnp.transpose(v, (0, 2, 1, 3))  # [B, num_kv_heads, T, head_dim]
 
-        # Transpose back to [B, T, num_heads, head_dim] and reshape
-        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))  # [B, T, num_heads, head_dim]
+            # Handle GQA: repeat k/v heads to match num_heads
+            if self.num_kv_heads < self.num_heads:
+                n_rep = self.num_heads // self.num_kv_heads
+                k = jnp.repeat(k, n_rep, axis=1)  # [B, num_heads, T, head_dim]
+                v = jnp.repeat(v, n_rep, axis=1)  # [B, num_heads, T, head_dim]
+
+            # Use Pallas flash attention wrapped in shard_map
+            # Mosaic kernels cannot be automatically partitioned, so we must use shard_map
+            # Layout: [batch, num_heads, seq_len, head_dim]
+            # Sharding: batch on "dp", heads on "tp" (if shard_attention_heads), seq/head_dim unsharded
+            sm_scale = 1.0 / math.sqrt(self.head_dim)
+            causal = kv_cache is None
+
+            if self.mesh is not None:
+                # Wrap flash_attention in shard_map for proper SPMD partitioning
+                attn_spec = P("dp", self.tp_shard, None, None)
+                flash_attention_sharded = shard_map(
+                    partial(flash_attention, causal=causal, sm_scale=sm_scale),
+                    mesh=self.mesh,
+                    in_specs=(attn_spec, attn_spec, attn_spec),
+                    out_specs=attn_spec,
+                    check_rep=False,
+                )
+                attn_output = flash_attention_sharded(q, k, v)
+            else:
+                # Fallback without shard_map (e.g., single device)
+                attn_output = flash_attention(q, k, v, causal=causal, sm_scale=sm_scale)
+            # attn_output: [B, num_heads, T, head_dim]
+
+            # Transpose back to [B, T, num_heads, head_dim]
+            attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))  # [B, T, num_heads, head_dim]
+
         output = attn_output.reshape(B, T, self.num_heads * self.head_dim)
         return self.o_proj(output), updated_cache
 

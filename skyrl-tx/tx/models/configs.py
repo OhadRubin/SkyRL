@@ -16,6 +16,9 @@ class Qwen3Config(PretrainedConfig):
         mlp_lora: Whether to enable LoRA for MLP layers
         attn_lora: Whether to enable LoRA for attention layers
         scan_layers: Whether to use scan over layers
+        use_ring_attention: Whether to use ring attention for distributed sequence parallelism
+        scan_query_chunk_size: Chunk size for query in blockwise/ring attention
+        scan_key_chunk_size: Chunk size for key/value in blockwise/ring attention
     """
 
     # Type hints for LoRA attributes
@@ -24,6 +27,10 @@ class Qwen3Config(PretrainedConfig):
     mlp_lora: bool
     attn_lora: bool
     scan_layers: bool
+    # Ring attention attributes
+    use_ring_attention: bool
+    scan_query_chunk_size: int
+    scan_key_chunk_size: int
 
     def __init__(
         self,
@@ -34,6 +41,9 @@ class Qwen3Config(PretrainedConfig):
         mlp_lora: bool = True,
         attn_lora: bool = True,
         scan_layers: bool = False,
+        use_ring_attention: bool = False,
+        scan_query_chunk_size: int = 1024,
+        scan_key_chunk_size: int = 1024,
     ):
         # Copy all attributes from the base config
         super().__init__(**config.to_dict())
@@ -44,3 +54,7 @@ class Qwen3Config(PretrainedConfig):
         self.mlp_lora = mlp_lora
         self.attn_lora = attn_lora
         self.scan_layers = scan_layers
+        # Ring attention parameters
+        self.use_ring_attention = use_ring_attention
+        self.scan_query_chunk_size = scan_query_chunk_size
+        self.scan_key_chunk_size = scan_key_chunk_size

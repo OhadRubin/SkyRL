@@ -136,6 +136,9 @@ class TinkerEngine:
             mlp_lora=self.config.mlp_lora,
             attn_lora=self.config.attn_lora,
             scan_layers=self.config.scan_layers,
+            use_ring_attention=self.config.use_ring_attention,
+            scan_query_chunk_size=self.config.scan_query_chunk_size,
+            scan_key_chunk_size=self.config.scan_key_chunk_size,
         )
 
         model_class = get_model_class(self.model_config)
