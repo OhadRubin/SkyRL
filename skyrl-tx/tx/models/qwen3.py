@@ -468,7 +468,8 @@ class Qwen3Model(nnx.Module):
                 )
                 def apply_layer_with_cache(layer, h, attn_mask, pos, k_cache, v_cache):
                     # Use remat to recompute forward during backward - saves O(num_layers) memory
-                    @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable)
+                    # prevent_cse=False allows XLA to optimize repeated computations in scan
+                    @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
                     def layer_forward(layer, h):
                         return layer(
                             h,
@@ -497,7 +498,8 @@ class Qwen3Model(nnx.Module):
                 def apply_layer_no_cache(layer, h, attn_mask, pos):
                     input_dtype = h.dtype
                     # Use remat to recompute forward during backward - saves O(num_layers) memory
-                    @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable)
+                    # prevent_cse=False allows XLA to optimize repeated computations in scan
+                    @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
                     def layer_forward(layer, h):
                         return layer(
                             h,
