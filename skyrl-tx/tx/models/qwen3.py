@@ -3,6 +3,7 @@ from flax.nnx.nn.lora import LoRALinear, LoRAParam
 import jax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
+from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 
 from tx.layers.lora import LoRAEmbed
 from tx.layers.util import Param, prepare_routing
@@ -118,16 +119,28 @@ class Qwen3Attention(nnx.Module):
 
         updated_cache = (k, v)
 
-        # Attention (causal only during prefill, GQA handled natively by dot_product_attention)
-        attn_output = jax.nn.dot_product_attention(
+        # Transpose to [B, num_heads, T, head_dim] for flash attention
+        q = jnp.transpose(q, (0, 2, 1, 3))  # [B, num_heads, T, head_dim]
+        k = jnp.transpose(k, (0, 2, 1, 3))  # [B, num_kv_heads, T, head_dim]
+        v = jnp.transpose(v, (0, 2, 1, 3))  # [B, num_kv_heads, T, head_dim]
+
+        # Handle GQA: repeat k/v heads to match num_heads
+        if self.num_kv_heads < self.num_heads:
+            n_rep = self.num_heads // self.num_kv_heads
+            k = jnp.repeat(k, n_rep, axis=1)  # [B, num_heads, T, head_dim]
+            v = jnp.repeat(v, n_rep, axis=1)  # [B, num_heads, T, head_dim]
+
+        # Use Pallas flash attention (memory-efficient, no materialized attention matrix)
+        attn_output = flash_attention(
             q,
             k,
             v,
-            scale=1.0 / self.head_dim**0.5,
-            mask=attention_mask[:, None, None, :].astype(bool),
-            is_causal=kv_cache is None,
-        )
+            causal=kv_cache is None,
+            sm_scale=1.0 / jnp.sqrt(jnp.float32(self.head_dim)),
+        )  # [B, num_heads, T, head_dim]
 
+        # Transpose back to [B, T, num_heads, head_dim] and reshape
+        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))  # [B, T, num_heads, head_dim]
         output = attn_output.reshape(B, T, self.num_heads * self.head_dim)
         return self.o_proj(output), updated_cache
 
