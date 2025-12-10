@@ -6,7 +6,6 @@ from flax.nnx.nn.lora import LoRALinear, LoRAParam
 import jax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh, PartitionSpec as P
-from jax.experimental.shard_map import shard_map
 from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 
 from tx.layers.lora import LoRAEmbed
@@ -150,9 +149,9 @@ class Qwen3Attention(nnx.Module):
                 jnp.full_like(attention_mask_expanded, jnp.finfo(x.dtype).min, dtype=x.dtype),
             )
 
-            # Wrap ringattention in shard_map - use "tp" axis for sequence parallelism
+            # Wrap ringattention in nnx.shard_map - use "tp" axis for sequence parallelism
             # Ring attention distributes sequence across devices in a ring topology
-            ring_attention_sharded = shard_map(
+            ring_attention_sharded = nnx.shard_map(
                 partial(
                     ringattention,
                     axis_name="tp",  # Use tp axis for ring communication
@@ -180,7 +179,6 @@ class Qwen3Attention(nnx.Module):
                     P("dp", None),              # segment_ids (None)
                 ),
                 out_specs=P("dp", "tp", None, None),
-                check_rep=False,
             )
             attn_output = ring_attention_sharded(q, k, v, attention_bias, None)
             # attn_output: [B, T, num_heads, head_dim]
@@ -205,14 +203,13 @@ class Qwen3Attention(nnx.Module):
             causal = kv_cache is None
 
             if self.mesh is not None:
-                # Wrap flash_attention in shard_map for proper SPMD partitioning
+                # Wrap flash_attention in nnx.shard_map for proper SPMD partitioning
                 attn_spec = P("dp", self.tp_shard, None, None)
-                flash_attention_sharded = shard_map(
+                flash_attention_sharded = nnx.shard_map(
                     partial(flash_attention, causal=causal, sm_scale=sm_scale),
                     mesh=self.mesh,
                     in_specs=(attn_spec, attn_spec, attn_spec),
                     out_specs=attn_spec,
-                    check_rep=False,
                 )
                 attn_output = flash_attention_sharded(q, k, v)
             else:
