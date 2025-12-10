@@ -10,29 +10,6 @@ from tx.models.types import CausalLMOutput, ModelOutput
 from tx.utils.generator import GeneratorMixin, KVCache, compute_positions
 
 
-class MixtureOfExpertsLayer(nnx.Module):
-    """Expert layer without LoRA - just a simple ragged_dot with expert weights."""
-
-    def __init__(
-        self,
-        num_experts: int,
-        in_features: int,
-        out_features: int,
-        *,
-        dtype: jnp.dtype = jnp.float32,
-        kernel_init: nnx.Initializer,
-        rngs: nnx.Rngs,
-    ) -> None:
-        self.num_experts = num_experts
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = Param(num_experts, in_features, out_features, dtype=dtype, kernel_init=kernel_init, rngs=rngs)
-
-    def __call__(self, x: jax.Array, group_sizes: jax.Array, adapter_indices_sorted: jax.Array | None = None) -> jax.Array:
-        # adapter_indices_sorted is ignored - no LoRA
-        return jax.lax.ragged_dot(x, self.weight.value, group_sizes)
-
-
 class RMSNorm(nnx.Module):
     def __init__(self, size: int, *, eps: float = 1e-6, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.eps = eps
@@ -68,10 +45,11 @@ class Qwen3Attention(nnx.Module):
         tp_shard = "tp" if shard_attention_heads else None
         self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
 
+        attn_lora_adapters = config.max_lora_adapters if getattr(config, "attn_lora", True) else 0
         self.q_proj = LoRALinear(
             in_features=config.hidden_size,
             out_features=self.num_heads * self.head_dim,
-            max_lora_adapters=config.max_lora_adapters,
+            max_lora_adapters=attn_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
             param_dtype=dtype,
@@ -82,7 +60,7 @@ class Qwen3Attention(nnx.Module):
         self.k_proj = LoRALinear(
             in_features=config.hidden_size,
             out_features=self.num_kv_heads * self.head_dim,
-            max_lora_adapters=config.max_lora_adapters,
+            max_lora_adapters=attn_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
             param_dtype=dtype,
@@ -93,7 +71,7 @@ class Qwen3Attention(nnx.Module):
         self.v_proj = LoRALinear(
             in_features=config.hidden_size,
             out_features=self.num_kv_heads * self.head_dim,
-            max_lora_adapters=config.max_lora_adapters,
+            max_lora_adapters=attn_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
             param_dtype=dtype,
@@ -104,7 +82,7 @@ class Qwen3Attention(nnx.Module):
         self.o_proj = LoRALinear(
             in_features=self.num_heads * self.head_dim,
             out_features=config.hidden_size,
-            max_lora_adapters=config.max_lora_adapters,
+            max_lora_adapters=attn_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
             param_dtype=dtype,
@@ -161,144 +139,82 @@ class Qwen3Attention(nnx.Module):
 class Qwen3MLP(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
-        self.use_lora = getattr(config, "mlp_lora", True)
-        if self.use_lora:
-            self.gate_proj = LoRALinear(
-                config.hidden_size,
-                config.intermediate_size,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
-                max_lora_adapters=config.max_lora_adapters,
-                max_lora_rank=config.max_lora_rank,
-                rngs=rngs,
-            )
-            self.up_proj = LoRALinear(
-                config.hidden_size,
-                config.intermediate_size,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
-                max_lora_adapters=config.max_lora_adapters,
-                max_lora_rank=config.max_lora_rank,
-                rngs=rngs,
-            )
-            self.down_proj = LoRALinear(
-                config.intermediate_size,
-                config.hidden_size,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("tp", None)),
-                max_lora_adapters=config.max_lora_adapters,
-                max_lora_rank=config.max_lora_rank,
-                rngs=rngs,
-            )
-        else:
-            self.gate_proj = nnx.Linear(
-                config.hidden_size,
-                config.intermediate_size,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
-                rngs=rngs,
-            )
-            self.up_proj = nnx.Linear(
-                config.hidden_size,
-                config.intermediate_size,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
-                rngs=rngs,
-            )
-            self.down_proj = nnx.Linear(
-                config.intermediate_size,
-                config.hidden_size,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("tp", None)),
-                rngs=rngs,
-            )
+        mlp_lora_adapters = config.max_lora_adapters if getattr(config, "mlp_lora", True) else 0
+        self.gate_proj = LoRALinear(
+            config.hidden_size,
+            config.intermediate_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=dtype,
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
+            max_lora_adapters=mlp_lora_adapters,
+            max_lora_rank=config.max_lora_rank,
+            rngs=rngs,
+        )
+        self.up_proj = LoRALinear(
+            config.hidden_size,
+            config.intermediate_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=dtype,
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
+            max_lora_adapters=mlp_lora_adapters,
+            max_lora_rank=config.max_lora_rank,
+            rngs=rngs,
+        )
+        self.down_proj = LoRALinear(
+            config.intermediate_size,
+            config.hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=dtype,
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("tp", None)),
+            max_lora_adapters=mlp_lora_adapters,
+            max_lora_rank=config.max_lora_rank,
+            rngs=rngs,
+        )
 
     def __call__(self, x: jax.Array, adapter_indices: jax.Array | None = None) -> jax.Array:
-        if self.use_lora:
-            gate_out = self.gate_proj(x, adapter_indices)
-            up_out = self.up_proj(x, adapter_indices)
-            return self.down_proj(nnx.silu(gate_out) * up_out, adapter_indices)
-        else:
-            gate_out = self.gate_proj(x)
-            up_out = self.up_proj(x)
-            return self.down_proj(nnx.silu(gate_out) * up_out)
+        gate_out = self.gate_proj(x, adapter_indices)
+        up_out = self.up_proj(x, adapter_indices)
+        return self.down_proj(nnx.silu(gate_out) * up_out, adapter_indices)
 
 
 class Qwen3Experts(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
-        self.use_lora = getattr(config, "mlp_lora", True)
-        if self.use_lora:
-            self.gate_proj = LoRAExpert(
-                config.num_experts,
-                config.hidden_size,
-                config.moe_intermediate_size,
-                max_lora_adapters=config.max_lora_adapters,
-                max_lora_rank=config.max_lora_rank,
-                dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp")),
-                rngs=rngs,
-            )
-            self.up_proj = LoRAExpert(
-                config.num_experts,
-                config.hidden_size,
-                config.moe_intermediate_size,
-                max_lora_adapters=config.max_lora_adapters,
-                max_lora_rank=config.max_lora_rank,
-                dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp")),
-                rngs=rngs,
-            )
-            self.down_proj = LoRAExpert(
-                config.num_experts,
-                config.moe_intermediate_size,
-                config.hidden_size,
-                max_lora_adapters=config.max_lora_adapters,
-                max_lora_rank=config.max_lora_rank,
-                dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", None)),
-                rngs=rngs,
-            )
-        else:
-                
-            
-            self.gate_proj = MixtureOfExpertsLayer(
-                config.num_experts,
-                config.hidden_size,
-                config.moe_intermediate_size,
-                dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp")),
-                rngs=rngs,
-            )
-            self.up_proj = MixtureOfExpertsLayer(
-                config.num_experts,
-                config.hidden_size,
-                config.moe_intermediate_size,
-                dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp")),
-                rngs=rngs,
-            )
-            self.down_proj = MixtureOfExpertsLayer(
-                config.num_experts,
-                config.moe_intermediate_size,
-                config.hidden_size,
-                dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", None)),
-                rngs=rngs,
-            )
+        mlp_lora_adapters = config.max_lora_adapters if getattr(config, "mlp_lora", True) else 0
+        self.gate_proj = LoRAExpert(
+            config.num_experts,
+            config.hidden_size,
+            config.moe_intermediate_size,
+            max_lora_adapters=mlp_lora_adapters,
+            max_lora_rank=config.max_lora_rank,
+            dtype=dtype,
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp")),
+            rngs=rngs,
+        )
+        self.up_proj = LoRAExpert(
+            config.num_experts,
+            config.hidden_size,
+            config.moe_intermediate_size,
+            max_lora_adapters=mlp_lora_adapters,
+            max_lora_rank=config.max_lora_rank,
+            dtype=dtype,
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp")),
+            rngs=rngs,
+        )
+        self.down_proj = LoRAExpert(
+            config.num_experts,
+            config.moe_intermediate_size,
+            config.hidden_size,
+            max_lora_adapters=mlp_lora_adapters,
+            max_lora_rank=config.max_lora_rank,
+            dtype=dtype,
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", None)),
+            rngs=rngs,
+        )
 
     def __call__(
         self, hidden_states: jax.Array, router_logits: jax.Array, adapter_indices: jax.Array | None = None
