@@ -130,6 +130,7 @@ class Qwen3Attention(nnx.Module):
             and self.mesh is not None
             and kv_cache is None  # Ring attention only for training, not inference
         )
+        use_ring = True
 
         if use_ring:
             # Ring attention path - uses [B, T, num_heads, head_dim] layout
