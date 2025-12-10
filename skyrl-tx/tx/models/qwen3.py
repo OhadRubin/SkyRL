@@ -210,6 +210,7 @@ class Qwen3Attention(nnx.Module):
                     mesh=self.mesh,
                     in_specs=(attn_spec, attn_spec, attn_spec),
                     out_specs=attn_spec,
+                    check_vma=False,
                 )
                 attn_output = flash_attention_sharded(q, k, v)
             else:
