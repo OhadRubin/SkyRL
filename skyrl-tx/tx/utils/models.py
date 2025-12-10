@@ -163,7 +163,7 @@ def load_safetensors(
         if filter_fn is not None and not filter_fn(path):
             continue
         # Skip LoRA parameters if requested
-        if skip_lora and ("lora_A" in path or "lora_B" in path or "lora_scaling" in path):
+        if skip_lora and ("lora_A" in path or "lora_B" in path or "lora_scaling" in path or "lora_ranks" in path):
             continue
 
         # Load tensor on demand
