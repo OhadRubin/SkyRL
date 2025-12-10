@@ -12,8 +12,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import safetensors
 import safetensors.numpy
 from transformers import PretrainedConfig
+from tqdm import tqdm
 import peft
 
 from tx.utils.log import logger
@@ -78,9 +80,46 @@ def get_param_key(path: tuple, prefix: str = "") -> str:
     return prefix + ".".join(map(str, path))
 
 
-def get_expert_key(path: tuple, expert_idx: int) -> str:
-    "Get the safetensors key for an expert weight model path."
+def is_scanned_layer_param(path: tuple) -> bool:
+    """Check if a param path is from a scanned layers module (no layer index)."""
+    # With scan_layers=True, paths look like ('model', 'layers', 'self_attn', ...)
+    # Without scan, paths have layer index: ('model', 'layers', '0', 'self_attn', ...)
+    if "layers" not in path:
+        return False
+    layers_idx = path.index("layers")
+    # If next element after 'layers' is not a digit, it's scanned
+    if layers_idx + 1 < len(path):
+        next_elem = path[layers_idx + 1]
+        return not (isinstance(next_elem, int) or (isinstance(next_elem, str) and next_elem.isdigit()))
+    return False
+
+
+def get_layer_param_key(path: tuple, layer_idx: int, prefix: str = "") -> str:
+    """Get the safetensors key for a scanned layer param at a specific layer index."""
+    # Insert layer index after 'layers' in path
+    if path[-1] in {"embedding", "kernel"}:
+        path = (*path[:-1], "weight")
+    elif path[-1] in {"lora_A", "lora_B"}:
+        path = (*path, "weight")
+
+    layers_idx = path.index("layers")
+    new_path = path[:layers_idx + 1] + (str(layer_idx),) + path[layers_idx + 1:]
+    return prefix + ".".join(map(str, new_path))
+
+
+def get_expert_key(path: tuple, expert_idx: int, layer_idx: int | None = None) -> str:
+    """Get the safetensors key for an expert weight model path.
+
+    If layer_idx is provided, inserts layer index after 'layers' (for scanned models).
+    """
+    if path[-1] in {"embedding", "kernel"}:
+        path = (*path[:-1], "weight")
     path = tuple(s if s != "experts" else f"experts.{expert_idx}" for s in path)
+
+    if layer_idx is not None and "layers" in path:
+        layers_idx = path.index("layers")
+        path = path[:layers_idx + 1] + (str(layer_idx),) + path[layers_idx + 1:]
+
     return ".".join(map(str, path))
 
 
@@ -92,30 +131,91 @@ def load_safetensors(
     prefix: str = "",
     filter_fn: Callable[[tuple], bool] | None = None,
 ) -> None:
-    tensors = {}
+    """Load safetensors with streaming to reduce peak memory usage.
+
+    Uses safetensors.safe_open for lazy loading - tensors are only loaded into
+    memory when accessed. Updates model parameters incrementally to minimize
+    device memory usage (only 1 extra tensor on device at a time).
+    """
+    # Build index: map each key to its file handle (lazy loading)
+    file_handles = []
+    key_to_handle = {}
     for file in Path(checkpoint_dir).glob("*.safetensors"):
-        tensors.update(safetensors.numpy.load_file(file))
-    tensors = {k.removeprefix(prefix): v for k, v in tensors.items()}
+        handle = safetensors.safe_open(file, framework="numpy")
+        file_handles.append(handle)
+        for key in handle.keys():
+            clean_key = key.removeprefix(prefix)
+            key_to_handle[clean_key] = (handle, key)
+
+    def get_tensor(key: str) -> np.ndarray:
+        """Load a single tensor on demand."""
+        if key not in key_to_handle:
+            raise KeyError(f"Key {key} not found in checkpoint")
+        handle, orig_key = key_to_handle[key]
+        return handle.get_tensor(orig_key)
+
+    # Check if model uses scan_layers
+    scan_layers = getattr(config, "scan_layers", False)
+    num_layers = getattr(config, "num_hidden_layers", None)
 
     model_params = nnx.to_flat_state(nnx.state(model))
-    updates = []
-    for path, param in model_params:
+    for path, param in tqdm(model_params, desc="Loading params"):
         if filter_fn is not None and not filter_fn(path):
             continue
-        key = get_param_key(path)
         # Skip LoRA parameters if requested
-        if skip_lora and ("lora_A" in path or "lora_B" in path or "lora_scaling" in path or "lora_ranks" in path):
+        if skip_lora and ("lora_A" in path or "lora_B" in path or "lora_scaling" in path):
             continue
+
+        # Load tensor on demand
         if "experts" in path:
-            tensors[key] = np.stack([tensors[get_expert_key(path, i)].T for i in range(config.num_experts)], axis=0)
+            if scan_layers and is_scanned_layer_param(path):
+                # For scanned layers with experts: load per-layer, per-expert tensors
+                # Shape will be [num_layers, num_experts, ...]
+                layer_tensors = []
+                for layer_idx in range(num_layers):
+                    expert_tensors = [get_tensor(get_expert_key(path, i, layer_idx)).T for i in range(config.num_experts)]
+                    layer_tensors.append(np.stack(expert_tensors, axis=0))
+                    del expert_tensors
+                tensor = np.stack(layer_tensors, axis=0)
+                del layer_tensors
+            else:
+                expert_tensors = [get_tensor(get_expert_key(path, i)).T for i in range(config.num_experts)]
+                tensor = np.stack(expert_tensors, axis=0)
+                del expert_tensors
+        elif scan_layers and is_scanned_layer_param(path):
+            # For scanned layers: nnx.vmap stacks weights during init, but checkpoint
+            # has individual layer weights. Load per-layer tensors and stack them.
+            layer_tensors = []
+            for layer_idx in range(num_layers):
+                layer_key = get_layer_param_key(path, layer_idx, prefix)
+                layer_tensor = get_tensor(layer_key)
+                layer_tensor = layer_tensor if "embed_tokens" in path else layer_tensor.T
+                if path[-2] in {"q_proj", "k_proj", "v_proj", "o_proj"}:
+                    # Reshape attention projections per-layer before stacking
+                    target_shape = param.shape[1:]  # Remove layer dim
+                    layer_tensor = layer_tensor.reshape(target_shape)
+                layer_tensors.append(layer_tensor)
+            tensor = np.stack(layer_tensors, axis=0)
+            del layer_tensors
         else:
-            tensors[key] = tensors[key] if "embed_tokens" in path else tensors[key].T
-        if path[-2] in {"q_proj", "k_proj", "v_proj", "o_proj"}:
-            tensors[key] = tensors[key].reshape(param.shape)
-        assert param.shape == tensors[key].shape, f"shape mismatch for {key}"
-        sharded_tensor = jax.device_put(tensors[key].astype(param.dtype), param.sharding)
-        updates.append((path, sharded_tensor))
-    nnx.update(model, nnx.from_flat_state(updates))
+            key = get_param_key(path)
+            tensor = get_tensor(key)
+            tensor = tensor if "embed_tokens" in path else tensor.T
+            if path[-2] in {"q_proj", "k_proj", "v_proj", "o_proj"}:
+                tensor = tensor.reshape(param.shape)
+
+        assert param.shape == tensor.shape, f"shape mismatch for {path}: expected {param.shape}, got {tensor.shape}"
+        sharded_tensor = jax.device_put(tensor.astype(param.dtype), param.sharding)
+
+        # Update model incrementally - only 1 extra tensor on device at a time
+        nnx.update(model, nnx.from_flat_state([(path, sharded_tensor)]))
+
+        # Explicit cleanup to free host memory immediately
+        del tensor
+        del sharded_tensor
+
+    # Close file handles
+    file_handles.clear()
 
 
 def save_safetensors(

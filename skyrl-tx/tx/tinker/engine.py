@@ -137,6 +137,9 @@ class TinkerEngine:
             max_lora_adapters=self.config.max_lora_adapters,
             max_lora_rank=self.config.max_lora_rank,
             shard_attention_heads=self.config.shard_attention_heads,
+            mlp_lora=self.config.mlp_lora,
+            attn_lora=self.config.attn_lora,
+            scan_layers=self.config.scan_layers,
         )
 
         model_class = get_model_class(self.model_config)
@@ -144,7 +147,7 @@ class TinkerEngine:
         # Create model and load weights
         self.mesh = jax.make_mesh((1, self.config.tensor_parallel_size), ("dp", "tp"))
         with jax.set_mesh(self.mesh):
-            self.model = model_class(self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0))
+            self.model = model_class(self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0), mesh=self.mesh)
             load_safetensors(checkpoint_path, self.model_config, self.model)
 
             # Split model into LoRA and non-LoRA parameters

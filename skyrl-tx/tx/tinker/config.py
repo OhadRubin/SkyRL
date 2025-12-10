@@ -23,6 +23,8 @@ class EngineConfig(BaseModel):
     )
     max_lora_adapters: int = Field(default=32, description="Maximum number of LoRA adapters")
     max_lora_rank: int = Field(default=32, description="Maximum LoRA rank")
+    mlp_lora: bool = Field(default=True, description="Whether to enable LoRA for MLP layers")
+    attn_lora: bool = Field(default=True, description="Whether to enable LoRA for attention layers")
     tensor_parallel_size: int = Field(default=1, description="Tensor parallelism degree to use for the model")
     train_micro_batch_size: int = Field(
         default=0,
@@ -41,6 +43,10 @@ class EngineConfig(BaseModel):
         default=False,
         description="Whether to use gradient checkpointing (full recomputation strategy)",
     )
+    precompile_seq_lens: str = Field(
+        default="",
+        description="Comma-separated list of sequence lengths to precompile JIT kernels for (e.g., '128,256,512,1024,2048')",
+    )
     external_inference_url: str | None = Field(
         default=None,
         description="URL of the external inference engine. If set, sample requests will be sent to the external engine instead (currently only VLLM is supported).",
@@ -53,6 +59,10 @@ class EngineConfig(BaseModel):
     external_inference_lora_base: Path = Field(
         default=Path("/tmp/lora_models"),
         description="Directory where LoRA models will be extracted for external inference engines",
+    )
+    scan_layers: bool = Field(
+        default=False,
+        description="Use scan over layers to reduce compilation graph size (reduces TPU HBM usage during compilation)",
     )
 
 
