@@ -121,10 +121,9 @@ class LoRAEmbed(LoRAMixin, nnx.Embed):
             embedding_init=embedding_init,
             rngs=rngs,
         )
-        assert (
-            self.embedding.value.sharding is not None
-        ), "LoRAEmbed layer needs sharding, you can specify it by using nnx.with_partitioning on the embedding_init"
-        sharding = self.embedding.value.sharding.spec
+        # Use nnx.get_partition_spec to get sharding info safely (works under tracing)
+        sharding = nnx.get_partition_spec(self.embedding)
+        assert sharding is not None, "LoRAEmbed layer needs sharding, you can specify it by using nnx.with_partitioning on the embedding_init"
 
         self.init_lora(
             max_lora_adapters=max_lora_adapters,
@@ -173,10 +172,9 @@ class LoRALinear(LoRAMixin, nnx.Linear):
             bias_init=bias_init,
             rngs=rngs,
         )
-        assert (
-            self.kernel.value.sharding is not None
-        ), "LoRALinear layer needs sharding, you can specify it by using nnx.with_partitioning on the kernel_init"
-        sharding = self.kernel.value.sharding.spec
+        # Use nnx.get_partition_spec to get sharding info safely (works under tracing)
+        sharding = nnx.get_partition_spec(self.kernel)
+        assert sharding is not None, "LoRALinear layer needs sharding, you can specify it by using nnx.with_partitioning on the kernel_init"
         self.init_lora(
             max_lora_adapters=max_lora_adapters,
             max_lora_rank=max_lora_rank,
@@ -214,8 +212,9 @@ class LoRAExpert(LoRAMixin, nnx.Module):
 
         self.weight = Param(num_experts, in_features, out_features, dtype=dtype, kernel_init=kernel_init, rngs=rngs)
 
-        assert self.weight.value.sharding is not None, "LoRAExpert layer needs sharding"
-        sharding = self.weight.value.sharding.spec
+        # Use nnx.get_partition_spec to get sharding info safely (works under tracing)
+        sharding = nnx.get_partition_spec(self.weight)
+        assert sharding is not None, "LoRAExpert layer needs sharding"
         self.init_lora(
             max_lora_adapters=max_lora_adapters,
             max_lora_rank=max_lora_rank,
