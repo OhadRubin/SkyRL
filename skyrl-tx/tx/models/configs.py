@@ -42,8 +42,8 @@ class Qwen3Config(PretrainedConfig):
         attn_lora: bool = True,
         scan_layers: bool = False,
         use_ring_attention: bool = False,
-        scan_query_chunk_size: int = 1024,
-        scan_key_chunk_size: int = 1024,
+        scan_query_chunk_size: int = 512,
+        scan_key_chunk_size: int = 512,
     ):
         # Copy all attributes from the base config
         super().__init__(**config.to_dict())
