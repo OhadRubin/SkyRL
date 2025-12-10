@@ -15,7 +15,7 @@ export TRANSFORMERS_CACHE=/dev/shm/huggingface_cache
 
 ADDITIONAL_FLAGS=""
 LOG_FILE="/tmp/tinker-api.log"
-MIN_SEQ_LEN=256
+MIN_SEQ_LEN=2048
 # MIN_SEQ_LEN=8192
 while [[ $# -gt 0 ]]; do
     case $1 in
