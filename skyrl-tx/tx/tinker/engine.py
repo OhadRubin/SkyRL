@@ -202,40 +202,25 @@ class TinkerEngine:
                 session.commit()
 
     def _create_loss_and_grad_fn(self):
-        """Compile and cache the loss function to avoid re-jitting on every call."""
+        """Compile and cache the loss function using nnx.value_and_grad.
 
-        # Wrap the model forward call to use nnx.remat for gradient checkpointing
-        def _model_forward(
-            graphdef: nnx.GraphDef,
-            lora_params: nnx.State,
-            non_lora_params: nnx.State,
+        This uses nnx.value_and_grad with DiffState to filter gradients to LoRA params only.
+        It passes the model directly instead of split state, which allows NNX transforms
+        like nnx.scan to work inside the forward pass without trace level errors.
+        """
+
+        def loss_for_model(
+            model,
             input_ids: jax.Array,
             attention_mask: jax.Array,
-            adapter_indices: jax.Array,
-        ) -> jax.Array:
-            model = nnx.merge(graphdef, lora_params, non_lora_params)
-            output = model(input_ids, attention_mask=attention_mask)
-            return output.logits
-
-        if self.config.gradient_checkpointing:
-            # policy=None corresponds to full activation recomputation
-            _model_forward = jax.checkpoint(_model_forward, policy=None)
-
-        def loss_for_lora(
-            lora_params: nnx.State,
-            non_lora_params: nnx.State,
-            input_ids: jax.Array,
-            attention_mask: jax.Array,
-            adapter_indices: jax.Array,
             target_ids: jax.Array,
             loss_mask: jax.Array,
             loss_fn_types: jax.Array,
             sampling_logprobs: jax.Array,
             advantages: jax.Array,
         ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
-            logits = _model_forward(
-                self.graphdef, lora_params, non_lora_params, input_ids, attention_mask, adapter_indices
-            )  # [B, T, V]
+            output = model(input_ids, attention_mask=attention_mask)
+            logits = output.logits  # [B, T, V]
 
             logprobs = jax.nn.log_softmax(logits, axis=-1)  # [B, T, V]
             target_logprobs = jnp.take_along_axis(logprobs, target_ids[..., None], axis=-1).squeeze(-1)
@@ -259,69 +244,50 @@ class TinkerEngine:
             )
 
             per_seq_loss = per_token_losses.sum(axis=-1) / loss_mask.sum(axis=-1)
-            # Return sum of losses (we'll divide gradients by per-adapter batch size later)
             return per_seq_loss.sum(), (target_logprobs, per_token_losses)
 
-        # Only differentiate with respect to lora_params (argnums=0)
-        loss_and_grad_fn = jax.value_and_grad(loss_for_lora, argnums=0, has_aux=True)
+        # Use nnx.value_and_grad with DiffState to filter to LoRA params only
+        lora_filter = nnx.All(nnx.Param, nnx.Any(nnx.PathContains("lora_a"), nnx.PathContains("lora_b")))
+        loss_and_grad_fn = nnx.value_and_grad(
+            loss_for_model,
+            argnums=nnx.DiffState(0, lora_filter),
+            has_aux=True
+        )
 
         def forward_backward_and_accumulate(
             accumulated_grads: AccumulatedGradients,
-            lora_params: nnx.State,
-            non_lora_params: nnx.State,
+            model,
             input_ids: jax.Array,
             attention_mask: jax.Array,
-            adapter_indices: jax.Array,
             target_ids: jax.Array,
             loss_mask: jax.Array,
             loss_fn_types: jax.Array,
             sampling_logprobs: jax.Array,
             advantages: jax.Array,
         ) -> tuple[AccumulatedGradients, jax.Array, jax.Array, jax.Array]:
-            """Fused forward-backward-accumulate operation."""
-            # Forward-backward
+            """Fused forward-backward-accumulate operation using nnx.value_and_grad."""
             (loss, (target_logprobs, per_token_losses)), lora_grads = loss_and_grad_fn(
-                lora_params,
-                non_lora_params,
+                model,
                 input_ids,
                 attention_mask,
-                adapter_indices,
                 target_ids,
                 loss_mask,
                 loss_fn_types,
                 sampling_logprobs,
                 advantages,
             )
+
             # Accumulate gradients
             batch_size = input_ids.shape[0]
             new_accumulated_grads = accumulated_grads.add(lora_grads, batch_size)
             return new_accumulated_grads, per_token_losses, target_logprobs, loss
 
         if self.config.enforce_eager:
-            # Disable JIT compilation for debugging
             self._forward_backward_and_accumulate = forward_backward_and_accumulate
-
         else:
-            # Retrieve the sharding of lora and non_lora params and compute the sharding of inputs and outputs
-            lora_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.lora_params)
-            )
-            non_lora_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.non_lora_params)
-            )
-            # Get sharding for AccumulatedGradients
-            accumulated_grads_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.accumulated_grads)
-            )
-
-            replicated = jax.NamedSharding(self.mesh, jax.P(None))
-            scalar = jax.NamedSharding(self.mesh, jax.P())
-
-            # JIT the fused function
-            self._forward_backward_and_accumulate = jax.jit(
+            # For nnx path, use nnx.jit which handles NNX modules properly
+            self._forward_backward_and_accumulate = nnx.jit(
                 forward_backward_and_accumulate,
-                in_shardings=(accumulated_grads_shardings, lora_shardings, non_lora_shardings) + (replicated,) * 8,
-                out_shardings=(accumulated_grads_shardings, replicated, replicated, scalar),
                 donate_argnames=("accumulated_grads",),
             )
 
@@ -359,7 +325,6 @@ class TinkerEngine:
                 # Create dummy inputs for precompilation
                 dummy_input_ids = jnp.zeros((micro_bs, seq_len), dtype=jnp.int32)
                 dummy_attention_mask = jnp.ones((micro_bs, seq_len), dtype=jnp.int32)
-                dummy_adapter_indices = jnp.zeros((micro_bs,), dtype=jnp.int32)
                 dummy_target_ids = jnp.zeros((micro_bs, seq_len), dtype=jnp.int32)
                 dummy_loss_mask = jnp.ones((micro_bs, seq_len), dtype=jnp.float32)
                 dummy_loss_fn_types = jnp.zeros((micro_bs,), dtype=jnp.int32)
@@ -370,11 +335,9 @@ class TinkerEngine:
                     # Run forward-backward to trigger JIT compilation
                     self.accumulated_grads, _, _, _ = self._forward_backward_and_accumulate(
                         self.accumulated_grads,
-                        self.lora_params,
-                        self.non_lora_params,
+                        self.model,
                         dummy_input_ids,
                         dummy_attention_mask,
-                        dummy_adapter_indices,
                         dummy_target_ids,
                         dummy_loss_mask,
                         dummy_loss_fn_types,
@@ -633,11 +596,9 @@ class TinkerEngine:
                 mb_end = min(mb_start + micro_bs, total_bs)
                 self.accumulated_grads, per_token_losses, target_logprobs, _ = self._forward_backward_and_accumulate(
                     self.accumulated_grads,
-                    self.lora_params,
-                    self.non_lora_params,
+                    self.model,
                     input_ids[mb_start:mb_end],
                     attention_mask[mb_start:mb_end],
-                    adapter_indices[mb_start:mb_end],
                     target_ids[mb_start:mb_end],
                     loss_mask[mb_start:mb_end],
                     loss_fn_types[mb_start:mb_end],
