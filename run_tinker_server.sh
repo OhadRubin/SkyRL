@@ -62,7 +62,7 @@ PRECOMPILE_SEQ_LENS=""
 sudo rm /tmp/libtpu_lockfile || true
 sleep 2
 # Run the server
-uv run --extra tinker --extra tpu -m tx.tinker.api \
+uv run --extra tinker --extra tpu  -m tx.tinker.api \
     --checkpoints-base "${CHECKPOINTS_BASE}" \
     ${ADDITIONAL_FLAGS} \
     --base-model "${BASE_MODEL}" \

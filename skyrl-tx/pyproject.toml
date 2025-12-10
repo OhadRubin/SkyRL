@@ -31,6 +31,7 @@ gpu = [
 
 tpu = [
     "jax[tpu]>=0.7.2",
+    "ringattention",
 ]
 
 tinker = [
