@@ -61,6 +61,10 @@ PRECOMPILE_SEQ_LENS=""
 
 sudo rm /tmp/libtpu_lockfile || true
 sleep 2
+
+# Fix deprecated JAX API in ringattention
+sed -i 's/jax.lib.xla_bridge.get_backend/jax.extend.backend.get_backend/' /home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/ringattention/__init__.py 2>/dev/null || true
+
 # Run the server
 # --gradient-checkpointing \
 uv run --extra tinker --extra tpu  -m tx.tinker.api \
