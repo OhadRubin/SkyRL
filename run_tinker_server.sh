@@ -15,14 +15,20 @@ export TRANSFORMERS_CACHE=/dev/shm/huggingface_cache
 
 ADDITIONAL_FLAGS=""
 LOG_FILE="/tmp/tinker-api.log"
+MIN_SEQ_LEN=32
+MIN_SEQ_LEN=8192
 while [[ $# -gt 0 ]]; do
     case $1 in
         --scan-layers)
-            ADDITIONAL_FLAGS="--scan-layers"
+            ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --scan-layers"
             shift
             ;;
         --log-file)
             LOG_FILE="$2"
+            shift 2
+            ;;
+        --min-seq-len)
+            MIN_SEQ_LEN="$2"
             shift 2
             ;;
         *)
@@ -69,4 +75,5 @@ uv run --extra tinker --extra tpu -m tx.tinker.api \
     --external-inference-url "${EXTERNAL_INFERENCE_URL}" \
     --external-inference-lora-base "${EXTERNAL_LORA_BASE}" \
     --precompile-seq-lens "${PRECOMPILE_SEQ_LENS}" \
+    --min-seq-len ${MIN_SEQ_LEN} \
     2>&1 | tee "${LOG_FILE}"

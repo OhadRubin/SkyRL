@@ -157,6 +157,7 @@ class TinkerEngine:
         )
 
         self._create_loss_and_grad_fn()
+        self._precompile_kernels()
 
     def _extract_checkpoint_data(self, model_id: str) -> dict:
         """Extract adapter state and optimizer state for checkpointing."""
@@ -336,6 +337,52 @@ class TinkerEngine:
             self._compute_grads_and_update = compute_grads_and_update
         else:
             self._compute_grads_and_update = nnx.jit(compute_grads_and_update)
+
+    def _precompile_kernels(self):
+        """Precompile JIT kernels for specified sequence lengths to avoid compilation during training."""
+        if not self.config.precompile_seq_lens or self.config.enforce_eager:
+            return
+
+        seq_lens = [int(s.strip()) for s in self.config.precompile_seq_lens.split(",") if s.strip()]
+        if not seq_lens:
+            return
+
+        logger.info(f"Precompiling JIT kernels for sequence lengths: {seq_lens}")
+
+        with jax.set_mesh(self.mesh):
+            micro_bs = max(1, self.config.train_micro_batch_size) if self.config.train_micro_batch_size > 0 else 1
+
+            for seq_len in seq_lens:
+                # Create dummy inputs for precompilation
+                dummy_input_ids = jnp.zeros((micro_bs, seq_len), dtype=jnp.int32)
+                dummy_attention_mask = jnp.ones((micro_bs, seq_len), dtype=jnp.int32)
+                dummy_adapter_indices = jnp.zeros((micro_bs,), dtype=jnp.int32)
+                dummy_target_ids = jnp.zeros((micro_bs, seq_len), dtype=jnp.int32)
+                dummy_loss_mask = jnp.ones((micro_bs, seq_len), dtype=jnp.float32)
+                dummy_loss_fn_types = jnp.zeros((micro_bs,), dtype=jnp.int32)
+                dummy_sampling_logprobs = jnp.zeros((micro_bs, seq_len), dtype=jnp.float32)
+                dummy_advantages = jnp.zeros((micro_bs, seq_len), dtype=jnp.float32)
+
+                with self._jit_timing_context(seq_len, mode="train"):
+                    # Run forward-backward to trigger JIT compilation
+                    self.accumulated_grads, _, _, _ = self._forward_backward_and_accumulate(
+                        self.accumulated_grads,
+                        self.lora_params,
+                        self.non_lora_params,
+                        dummy_input_ids,
+                        dummy_attention_mask,
+                        dummy_adapter_indices,
+                        dummy_target_ids,
+                        dummy_loss_mask,
+                        dummy_loss_fn_types,
+                        dummy_sampling_logprobs,
+                        dummy_advantages,
+                    )
+
+                # Reset accumulated grads after precompilation
+                self.accumulated_grads = AccumulatedGradients.create(self.lora_params)
+
+        logger.info(f"Precompilation complete for {len(seq_lens)} sequence lengths")
 
     def _micro_batch_size(self, total: int) -> int:
         """Return effective micro-batch size; 0/absent => disabled (use full fused batch)."""
@@ -556,7 +603,7 @@ class TinkerEngine:
             request_batch_slices.append((request_id, model_id, request_start, len(all_input_ids)))
 
         # Pad sequences to same length. Also bin it so the JIT has to compile fewer kernels.
-        max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids))
+        max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids), self.config.min_seq_len)
 
         input_ids = pad_batch(all_input_ids, max_len, np.int32)
         target_ids = pad_batch(all_targets, max_len, np.int32)
@@ -701,7 +748,7 @@ class TinkerEngine:
                 # Pad sequences to same length within the batch to minimize memory usage.
                 # Also bin it so the JIT has to compile fewer kernels.
                 # Use left-padding for sampling so the last position is always the last real token.
-                max_len = round_up_seq_len(max((len(seq) for seq in batch_prompts), default=0))
+                max_len = round_up_seq_len(max((len(seq) for seq in batch_prompts), default=0), self.config.min_seq_len)
                 input_ids = pad_batch(batch_prompts, max_len, np.int32, left=True)
                 attention_mask = pad_batch([[1] * len(seq) for seq in batch_prompts], max_len, np.int32, left=True)
 

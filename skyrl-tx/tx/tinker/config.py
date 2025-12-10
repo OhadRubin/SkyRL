@@ -64,6 +64,10 @@ class EngineConfig(BaseModel):
         default=False,
         description="Use scan over layers to reduce compilation graph size (reduces TPU HBM usage during compilation)",
     )
+    min_seq_len: int = Field(
+        default=32,
+        description="Minimum sequence length for padding buckets (sequences shorter than this are padded up to this length)",
+    )
 
 
 def convert_env_var(env_name: str, env_value: str, expected_type: type):
