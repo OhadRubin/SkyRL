@@ -398,12 +398,15 @@ class Qwen3Model(nnx.Module):
                     transform_metadata={nnx.PARTITION_NAME: None},
                 )
                 def apply_layer_no_cache(layer, h, attn_mask, pos):
+                    input_dtype = h.dtype
                     h, (k, v) = layer(
                         h,
                         attention_mask=attn_mask,
                         positions=pos,
                         kv_cache=None,
                     )
+                    # Ensure output dtype matches input dtype for scan compatibility
+                    h = h.astype(input_dtype)
                     return h, (k, v)
 
                 hidden_states, (updated_keys, updated_values) = apply_layer_no_cache(
