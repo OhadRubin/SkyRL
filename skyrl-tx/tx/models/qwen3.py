@@ -1,10 +1,12 @@
 import math
+from functools import partial
 
 from flax import nnx
 from flax.nnx.nn.lora import LoRALinear, LoRAParam
 import jax
 from jax import numpy as jnp
-from jax.sharding import get_abstract_mesh
+from jax.sharding import get_abstract_mesh, PartitionSpec as P
+from jax.experimental.shard_map import shard_map
 from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 
 from tx.layers.lora import LoRAEmbed
@@ -37,8 +39,9 @@ def apply_rope(inputs: jax.Array, position_ids: jax.Array, head_dim: int, theta:
 
 class Qwen3Attention(nnx.Module):
 
-    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs, mesh=None) -> None:
         self.config = config
+        self.mesh = mesh
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         tp = get_abstract_mesh().shape.get("tp", 1)
@@ -47,6 +50,7 @@ class Qwen3Attention(nnx.Module):
             assert self.num_heads % tp == 0, f"num_heads={self.num_heads} must be divisible by tp={tp}"
             assert self.num_kv_heads % tp == 0, f"num_kv_heads={self.num_kv_heads} must be divisible by tp={tp}"
         tp_shard = "tp" if shard_attention_heads else None
+        self.tp_shard = tp_shard
         self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
 
         lora_rank = config.lora_rank if getattr(config, "attn_lora", True) else 0
@@ -132,15 +136,28 @@ class Qwen3Attention(nnx.Module):
             k = jnp.repeat(k, n_rep, axis=1)  # [B, num_heads, T, head_dim]
             v = jnp.repeat(v, n_rep, axis=1)  # [B, num_heads, T, head_dim]
 
-        # Use Pallas flash attention (memory-efficient, no materialized attention matrix)
-        # sm_scale must be a static Python float, not a JAX tracer
-        attn_output = flash_attention(
-            q,
-            k,
-            v,
-            causal=kv_cache is None,
-            sm_scale=1.0 / math.sqrt(self.head_dim),
-        )  # [B, num_heads, T, head_dim]
+        # Use Pallas flash attention wrapped in shard_map
+        # Mosaic kernels cannot be automatically partitioned, so we must use shard_map
+        # Layout: [batch, num_heads, seq_len, head_dim]
+        # Sharding: batch on "dp", heads on "tp" (if shard_attention_heads), seq/head_dim unsharded
+        sm_scale = 1.0 / math.sqrt(self.head_dim)
+        causal = kv_cache is None
+
+        if self.mesh is not None:
+            # Wrap flash_attention in shard_map for proper SPMD partitioning
+            attn_spec = P("dp", self.tp_shard, None, None)
+            flash_attention_sharded = shard_map(
+                partial(flash_attention, causal=causal, sm_scale=sm_scale),
+                mesh=self.mesh,
+                in_specs=(attn_spec, attn_spec, attn_spec),
+                out_specs=attn_spec,
+                check_rep=False,
+            )
+            attn_output = flash_attention_sharded(q, k, v)
+        else:
+            # Fallback without shard_map (e.g., single device)
+            attn_output = flash_attention(q, k, v, causal=causal, sm_scale=sm_scale)
+        # attn_output: [B, num_heads, T, head_dim]
 
         # Transpose back to [B, T, num_heads, head_dim] and reshape
         attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))  # [B, T, num_heads, head_dim]
@@ -270,10 +287,10 @@ class Qwen3MoeSparseMoeBlock(nnx.Module):
 
 class Qwen3DecoderLayer(nnx.Module):
 
-    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs, mesh=None) -> None:
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
-        self.self_attn = Qwen3Attention(config, dtype=dtype, rngs=rngs)
+        self.self_attn = Qwen3Attention(config, dtype=dtype, rngs=rngs, mesh=mesh)
         if getattr(config, "num_experts", None):
             self.mlp = Qwen3MoeSparseMoeBlock(config, dtype=dtype, rngs=rngs)
         else:
@@ -329,12 +346,12 @@ class Qwen3Model(nnx.Module):
             keys = jax.random.split(rngs.params(), config.num_hidden_layers)
 
             @nnx.vmap(
-                in_axes=(None, None, 0),  # keys vectorized on axis 0
+                in_axes=(None, None, 0, None),  # keys vectorized on axis 0, mesh is static
                 out_axes=0,  # All module state stacked on axis 0
                 transform_metadata={nnx.PARTITION_NAME: None},  # Layer axis not sharded
             )
-            def create_layer(cfg, dt, key):
-                return Qwen3DecoderLayer(cfg, dtype=dt, rngs=nnx.Rngs(key))
+            def create_layer(cfg, dt, key, msh):
+                return Qwen3DecoderLayer(cfg, dtype=dt, rngs=nnx.Rngs(key), mesh=msh)
 
             if mesh is None:
                 raise ValueError("mesh must be provided when scan_layers=True to enable sharded initialization")
@@ -343,13 +360,13 @@ class Qwen3Model(nnx.Module):
             # JAX will optimize away intermediate allocations and create sharded arrays
             @jax.jit
             def create_layers():
-                return create_layer(config, dtype, keys)
+                return create_layer(config, dtype, keys, mesh)
 
             with jax.set_mesh(mesh):
                 self.layers = create_layers()
         else:
             self.layers = nnx.List(
-                [Qwen3DecoderLayer(config, dtype=dtype, rngs=rngs) for _ in range(config.num_hidden_layers)]
+                [Qwen3DecoderLayer(config, dtype=dtype, rngs=rngs, mesh=mesh) for _ in range(config.num_hidden_layers)]
             )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
