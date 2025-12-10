@@ -467,12 +467,16 @@ class Qwen3Model(nnx.Module):
                     transform_metadata={nnx.PARTITION_NAME: None},
                 )
                 def apply_layer_with_cache(layer, h, attn_mask, pos, k_cache, v_cache):
-                    h, (k, v) = layer(
-                        h,
-                        attention_mask=attn_mask,
-                        positions=pos,
-                        kv_cache=(k_cache, v_cache, cache_position),
-                    )
+                    # Use remat to recompute forward during backward - saves O(num_layers) memory
+                    @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable)
+                    def layer_forward(layer, h):
+                        return layer(
+                            h,
+                            attention_mask=attn_mask,
+                            positions=pos,
+                            kv_cache=(k_cache, v_cache, cache_position),
+                        )
+                    h, (k, v) = layer_forward(layer, h)
                     return h, (k, v)
 
                 hidden_states, (updated_keys, updated_values) = apply_layer_with_cache(
@@ -492,12 +496,16 @@ class Qwen3Model(nnx.Module):
                 )
                 def apply_layer_no_cache(layer, h, attn_mask, pos):
                     input_dtype = h.dtype
-                    h, (k, v) = layer(
-                        h,
-                        attention_mask=attn_mask,
-                        positions=pos,
-                        kv_cache=None,
-                    )
+                    # Use remat to recompute forward during backward - saves O(num_layers) memory
+                    @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable)
+                    def layer_forward(layer, h):
+                        return layer(
+                            h,
+                            attention_mask=attn_mask,
+                            positions=pos,
+                            kv_cache=None,
+                        )
+                    h, (k, v) = layer_forward(layer, h)
                     # Ensure output dtype matches input dtype for scan compatibility
                     h = h.astype(input_dtype)
                     return h, (k, v)
