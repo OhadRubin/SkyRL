@@ -16,8 +16,8 @@ export TRANSFORMERS_CACHE=/dev/shm/huggingface_cache
 ADDITIONAL_FLAGS=""
 LOG_FILE="/tmp/tinker-api.log"
 # MIN_SEQ_LEN=4096
-# MIN_SEQ_LEN=8192
-MIN_SEQ_LEN=65536
+MIN_SEQ_LEN=8192
+# MIN_SEQ_LEN=65536
 while [[ $# -gt 0 ]]; do
     case $1 in
         --scan-layers)
@@ -49,7 +49,7 @@ export USE_NNX_VALUE_AND_GRAD=1
 BASE_MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507"
 TENSOR_PARALLEL_SIZE=4
 MAX_LORA_ADAPTERS=4
-MAX_LORA_RANK=128
+MAX_LORA_RANK=8
 TRAIN_MICRO_BATCH_SIZE=1
 
 # External inference server
