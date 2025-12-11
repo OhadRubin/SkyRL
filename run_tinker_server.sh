@@ -76,6 +76,9 @@ ts "Clearing TPU lockfile"
 sudo rm /tmp/libtpu_lockfile || true
 sleep 2
 
+ts "Reinstalling flax fork with segment_length support"
+uv pip install --reinstall git+https://github.com/OhadRubin/flax@remat-scan-nnx --quiet
+
 ts "Reinstalling ringattention"
 # Reinstall ringattention to get clean copy, then fix deprecated JAX API
 uv pip install --reinstall ringattention --quiet
