@@ -447,14 +447,9 @@ class Qwen3Model(nnx.Module):
 
             # Pre-split keys outside eval_shape to avoid RNG mutation in traced context
             keys = jax.random.split(rngs.params(), config.num_hidden_layers)
-
-            @nnx.vmap(
-                in_axes=(None, None, 0, None),  # keys vectorized on axis 0, mesh is static
-                out_axes=nnx.StateAxes({...: 0}),  # All module state stacked on axis 0
-                transform_metadata={nnx.PARTITION_NAME: 'layer'},
-            )
-            def create_layer(cfg, dt, key, msh):
-                return Qwen3DecoderLayer(cfg, dtype=dt, rngs=nnx.Rngs(key), mesh=msh)
+            @nnx.vmap(in_axes=0, out_axes=0, transform_metadata={nnx.PARTITION_NAME: 'layer'})
+            def create_layer(key):
+                return Qwen3DecoderLayer(config, dtype=dtype, rngs=nnx.Rngs(key), mesh=mesh)
 
             if mesh is None:
                 raise ValueError("mesh must be provided when scan_layers=True to enable sharded initialization")
@@ -463,7 +458,7 @@ class Qwen3Model(nnx.Module):
             # JAX will optimize away intermediate allocations and create sharded arrays
             @nnx.jit
             def create_layers():
-                return create_layer(config, dtype, keys, mesh)
+                return create_layer(keys)
 
             with jax.set_mesh(mesh):
                 self.layers = create_layers()
@@ -526,15 +521,8 @@ class Qwen3Model(nnx.Module):
             else:
                 # Scan Params and RngState on axis 0, broadcast everything else
                 layer_state_axes = nnx.StateAxes({(nnx.Param, nnx.RngState): 0, ...: None})
-
-                @nnx.scan(
-                    in_axes=(layer_state_axes, nnx.Carry, None, None),
-                    out_axes=nnx.Carry,  # Only carry hidden_states, discard KV to save memory
-                    length=num_layers,  # Explicit length helps XLA recognize this as a loop
-                    transform_metadata={nnx.PARTITION_NAME: 'layer'},
-                )
-                @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
-                def apply_layer_no_cache(layer, h, attn_mask, pos):
+                def scan_fn(carry, layer):
+                    h, attn_mask, pos = carry
                     input_dtype = h.dtype
                     h, _ = layer(
                         h,
@@ -544,11 +532,21 @@ class Qwen3Model(nnx.Module):
                     )
                     # Ensure output dtype matches input dtype for scan compatibility
                     h = h.astype(input_dtype)
-                    return h
+                    new_carry = (h, attn_mask, pos)
+                    return new_carry, None
 
-                hidden_states = apply_layer_no_cache(
-                    self.layers, hidden_states, attention_mask, positions
-                )
+                scan_fn = nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)(scan_fn)
+                initial_carry = (hidden_states, attention_mask, positions)
+                final_carry, _ = nnx.scan(
+                    scan_fn,
+                    length=num_layers,
+                    # in_axes=(nnx.Carry, layer_state_axes),
+                    in_axes=(nnx.Carry, 0),
+                    out_axes=(nnx.Carry, 0),
+                    # transform_metadata={nnx.PARTITION_NAME: 'layer'},
+                )(initial_carry, self.layers)
+
+                hidden_states, _, _ = final_carry
 
             # No KV cache needed during training (scan without cache)
             updated_keys = []
