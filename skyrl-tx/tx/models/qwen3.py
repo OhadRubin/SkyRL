@@ -527,6 +527,8 @@ class Qwen3Model(nnx.Module):
             else:
                 # Scan Params and RngState on axis 0, broadcast everything else
                 layer_state_axes = nnx.StateAxes({(nnx.Param, nnx.RngState): 0, ...: None})
+
+                @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
                 def scan_fn(carry, layer):
                     h, attn_mask, pos = carry
                     input_dtype = h.dtype
