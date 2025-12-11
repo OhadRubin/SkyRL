@@ -222,7 +222,7 @@ class Qwen3Attention(nnx.Module):
 
             if self.mesh is not None:
                 # Wrap flash_attention in nnx.shard_map for proper SPMD partitioning
-                attn_spec = P("dp", self.tp_shard, None, None)
+                attn_spec = P(("dp","layer"), self.tp_shard, None, None)
                 flash_attention_sharded = nnx.shard_map(
                     partial(flash_attention, causal=causal, sm_scale=sm_scale),
                     mesh=self.mesh,
