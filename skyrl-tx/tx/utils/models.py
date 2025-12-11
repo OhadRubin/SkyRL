@@ -212,9 +212,9 @@ def load_safetensors(
                 layer_tensor = layer_tensor if "embed_tokens" in path else layer_tensor.T
                 if path[-2] in {"q_proj", "k_proj", "v_proj", "o_proj"}:
                     # Reshape attention projections per-layer before stacking
-                    # If segment_length is set, param.shape is [num_segments, segment_length, ...], skip 2 dims
+                    # If reshape_for_scan is enabled, param.shape is [num_segments, segment_length, ...], skip 2 dims
                     # Otherwise param.shape is [num_layers, ...], skip 1 dim
-                    skip_dims = 2 if segment_length is not None else 1
+                    skip_dims = 2 if reshape_for_scan and segment_length is not None else 1
                     target_shape = param.shape[skip_dims:]
                     layer_tensor = layer_tensor.reshape(target_shape)
                 layer_tensors.append(layer_tensor)
