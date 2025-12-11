@@ -15,11 +15,23 @@ from tx.models.types import CausalLMOutput, ModelOutput
 from tx.utils.generator import GeneratorMixin, KVCache, compute_positions
 
 
+def scan_partition_spec(spec: tuple, scan_layers: bool) -> tuple:
+    """Prepend None to partition spec when using scanned layers.
+
+    When layers are stacked via vmap for scan, weights get a leading layer axis.
+    This axis should be unsharded (None) in the partition spec.
+    """
+    if scan_layers:
+        return (None,) + spec
+    return spec
+
+
 class RMSNorm(nnx.Module):
-    def __init__(self, size: int, *, eps: float = 1e-6, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+    def __init__(self, size: int, *, eps: float = 1e-6, dtype: jnp.dtype, rngs: nnx.Rngs, scan_layers: bool = False) -> None:
         self.eps = eps
+        spec = scan_partition_spec((None,), scan_layers)
         self.weight = Param(
-            size, dtype=dtype, kernel_init=nnx.with_partitioning(nnx.initializers.normal(), (None,)), rngs=rngs
+            size, dtype=dtype, kernel_init=nnx.with_partitioning(nnx.initializers.normal(), spec), rngs=rngs
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -52,6 +64,7 @@ class Qwen3Attention(nnx.Module):
         self.tp_shard = tp_shard
         self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
 
+        scan_layers = getattr(config, "scan_layers", False)
         lora_rank = config.lora_rank if getattr(config, "attn_lora", True) else 0
         self.q_proj = LoRALinear(
             in_features=config.hidden_size,
@@ -60,7 +73,7 @@ class Qwen3Attention(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
             use_bias=False,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, tp_shard)),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), scan_partition_spec((None, tp_shard), scan_layers)),
             rngs=rngs,
         )
         self.k_proj = LoRALinear(
@@ -70,7 +83,7 @@ class Qwen3Attention(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
             use_bias=False,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, tp_shard)),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), scan_partition_spec((None, tp_shard), scan_layers)),
             rngs=rngs,
         )
         self.v_proj = LoRALinear(
@@ -80,7 +93,7 @@ class Qwen3Attention(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
             use_bias=False,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, tp_shard)),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), scan_partition_spec((None, tp_shard), scan_layers)),
             rngs=rngs,
         )
         self.o_proj = LoRALinear(
@@ -90,12 +103,12 @@ class Qwen3Attention(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
             use_bias=False,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (tp_shard, None)),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), scan_partition_spec((tp_shard, None), scan_layers)),
             rngs=rngs,
         )
 
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs, scan_layers=scan_layers)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs, scan_layers=scan_layers)
 
     def __call__(
         self,
@@ -255,6 +268,7 @@ class Qwen3Attention(nnx.Module):
 class Qwen3MLP(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+        scan_layers = getattr(config, "scan_layers", False)
         lora_rank = config.lora_rank if getattr(config, "mlp_lora", True) else 0
         self.gate_proj = LoRALinear(
             config.hidden_size,
@@ -262,7 +276,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), scan_partition_spec((None, "tp"), scan_layers)),
             lora_rank=lora_rank,
             rngs=rngs,
         )
@@ -272,7 +286,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), scan_partition_spec((None, "tp"), scan_layers)),
             lora_rank=lora_rank,
             rngs=rngs,
         )
@@ -282,7 +296,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("tp", None)),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), scan_partition_spec(("tp", None), scan_layers)),
             lora_rank=lora_rank,
             rngs=rngs,
         )
@@ -303,19 +317,20 @@ class Qwen3Experts(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
+        scan_layers = getattr(config, "scan_layers", False)
         # MoE experts use regular Linear layers (no LoRA for now in single-adapter mode)
         self.gate_proj = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp"))(
+            nnx.with_partitioning(nnx.initializers.lecun_normal(), scan_partition_spec((None, None, "tp"), scan_layers))(
                 rngs.params(), (config.num_experts, config.hidden_size, config.moe_intermediate_size), dtype
             )
         )
         self.up_proj = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp"))(
+            nnx.with_partitioning(nnx.initializers.lecun_normal(), scan_partition_spec((None, None, "tp"), scan_layers))(
                 rngs.params(), (config.num_experts, config.hidden_size, config.moe_intermediate_size), dtype
             )
         )
         self.down_proj = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", None))(
+            nnx.with_partitioning(nnx.initializers.lecun_normal(), scan_partition_spec((None, "tp", None), scan_layers))(
                 rngs.params(), (config.num_experts, config.moe_intermediate_size, config.hidden_size), dtype
             )
         )
@@ -349,13 +364,14 @@ class Qwen3MoeSparseMoeBlock(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
+        scan_layers = getattr(config, "scan_layers", False)
         self.gate = nnx.Linear(
             config.hidden_size,
             config.num_experts,
             use_bias=False,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None)),
+            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), scan_partition_spec((None, None), scan_layers)),
             rngs=rngs,
         )
         self.experts = Qwen3Experts(config, dtype=dtype, rngs=rngs)
@@ -381,8 +397,9 @@ class Qwen3MoeSparseMoeBlock(nnx.Module):
 class Qwen3DecoderLayer(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs, mesh=None) -> None:
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
+        scan_layers = getattr(config, "scan_layers", False)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs, scan_layers=scan_layers)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs, scan_layers=scan_layers)
         self.self_attn = Qwen3Attention(config, dtype=dtype, rngs=rngs, mesh=mesh)
         if getattr(config, "num_experts", None):
             self.mlp = Qwen3MoeSparseMoeBlock(config, dtype=dtype, rngs=rngs)
@@ -451,7 +468,7 @@ class Qwen3Model(nnx.Module):
             @nnx.vmap(
                 in_axes=(None, None, 0, None),  # keys vectorized on axis 0, mesh is static
                 out_axes=nnx.StateAxes({...: 0}),  # All module state stacked on axis 0
-                transform_metadata={nnx.PARTITION_NAME: None},  # Layer axis not sharded
+                transform_metadata={nnx.PARTITION_NAME: 'layer'},  # Layer axis has partition name for sharding
             )
             def create_layer(cfg, dt, key, msh):
                 return Qwen3DecoderLayer(cfg, dtype=dt, rngs=nnx.Rngs(key), mesh=msh)
@@ -507,7 +524,7 @@ class Qwen3Model(nnx.Module):
                     in_axes=(layer_state_axes, nnx.Carry, None, None, 0, 0),
                     out_axes=(nnx.Carry, (0, 0)),
                     length=num_layers,  # Explicit length helps XLA recognize this as a loop
-                    transform_metadata={nnx.PARTITION_NAME: None},
+                    transform_metadata={nnx.PARTITION_NAME: 'layer'},
                 )
                 def apply_layer_with_cache(layer, h, attn_mask, pos, k_cache, v_cache):
                     # Remat is applied inside Qwen3Attention and Qwen3MLP, not here
@@ -533,7 +550,7 @@ class Qwen3Model(nnx.Module):
                     in_axes=(layer_state_axes, nnx.Carry, None, None),
                     out_axes=nnx.Carry,  # Only carry hidden_states, discard KV to save memory
                     length=num_layers,  # Explicit length helps XLA recognize this as a loop
-                    transform_metadata={nnx.PARTITION_NAME: None},
+                    transform_metadata={nnx.PARTITION_NAME: 'layer'},
                 )
                 def apply_layer_no_cache(layer, h, attn_mask, pos):
                     # Remat is applied inside Qwen3Attention and Qwen3MLP, not here
