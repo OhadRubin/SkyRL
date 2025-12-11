@@ -40,6 +40,8 @@ done
 
 export JAX_LOG_COMPILES=1
 export JAX_TRACEBACK_FILTERING=off
+export JAX_DUMP_IR_MODES='jaxpr'
+export JAX_DUMP_IR_TO='/tmp/jax_ir_dump'
 sudo chown -R $(whoami) /dev/shm/huggingface_cache
 # Date-based checkpoint path
 DATE=$(date +%Y%m%d)
