@@ -77,11 +77,12 @@ sudo rm /tmp/libtpu_lockfile || true
 sleep 2
 
 ts "Reinstalling flax fork with segment_length support"
-~/SkyRL/skyrl-tx/.venv/bin/pip install --force-reinstall --no-cache-dir git+https://github.com/OhadRubin/flax@remat-scan-nnx
+# ~/SkyRL/skyrl-tx/.venv/bin/pip install --force-reinstall --no-cache-dir git+https://github.com/OhadRubin/flax@remat-scan-nnx
 
 ts "Reinstalling ringattention"
 # Reinstall ringattention to get clean copy, then fix deprecated JAX API
 uv pip install --reinstall ringattention --quiet
+uv sync
 RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/ringattention/__init__.py"
 sed -i 's/jax.lib.xla_bridge.get_backend/jax.extend.backend.get_backend/' "$RING_INIT"
 sed -i 's/^import jax$/import jax\nimport jax.extend/' "$RING_INIT"
