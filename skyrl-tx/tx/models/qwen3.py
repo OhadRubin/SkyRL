@@ -456,7 +456,7 @@ class Qwen3Model(nnx.Module):
         )
 
         # Remat the embedding to avoid saving large vocab-sized intermediates during backward
-        @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
+        @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=True)
         def embed_forward(embed_tokens, ids):
             return embed_tokens(ids)
 
@@ -613,13 +613,13 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
 
         # Remat the lm_head to avoid saving large vocab-sized intermediates during backward
         if self.config.tie_word_embeddings:
-            @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
+            @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=True)
             def lm_head_forward(embed_tokens, h):
                 return h @ embed_tokens.embedding.value.T
 
             logits = lm_head_forward(self.model.embed_tokens, hidden_states)
         else:
-            @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
+            @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=True)
             def lm_head_forward(lm_head, h):
                 return lm_head(h)
 
