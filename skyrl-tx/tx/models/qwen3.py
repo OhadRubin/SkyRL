@@ -462,6 +462,22 @@ class Qwen3Model(nnx.Module):
 
             with jax.set_mesh(mesh):
                 self.layers = create_layers()
+
+            # If segment_length is set, reshape layer state from [num_layers, ...] to [num_segments, segment_length, ...]
+            if config.segment_length is not None:
+                num_segments = config.num_hidden_layers // config.segment_length
+                segment_length = config.segment_length
+
+                def reshape_to_segments(x):
+                    if hasattr(x, 'shape') and hasattr(x, 'reshape') and x.ndim > 0:
+                        new_shape = (num_segments, segment_length) + x.shape[1:]
+                        return x.reshape(new_shape)
+                    return x
+
+                # Get state, reshape, and update
+                state = nnx.state(self.layers)
+                reshaped_state = jax.tree.map(reshape_to_segments, state)
+                nnx.update(self.layers, reshaped_state)
         else:
             self.layers = nnx.List(
                 [Qwen3DecoderLayer(config, dtype=dtype, rngs=rngs, mesh=mesh) for _ in range(config.num_hidden_layers)]
@@ -546,12 +562,12 @@ class Qwen3Model(nnx.Module):
                 initial_carry = (hidden_states, attention_mask, positions)
 
                 # Use segment_length for memory-efficient rematerialization
-                # With 48 layers and segment_length=8, saves 6 boundary states instead of 48
+                # e.g., with 48 layers and segment_length=8, saves 6 boundary states instead of 48
                 final_carry, _ = nnx.scan(
                     scan_fn,
                     length=num_layers,
                     in_axes=(nnx.Carry, 0),
-                    segment_length=8,
+                    segment_length=self.config.segment_length,
                 )(initial_carry, self.layers)
 
                 hidden_states, _, _ = final_carry

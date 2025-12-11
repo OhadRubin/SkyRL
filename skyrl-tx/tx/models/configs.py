@@ -17,6 +17,7 @@ class Qwen3Config(PretrainedConfig):
         attn_lora: Whether to enable LoRA for attention layers
         embed_lora: Whether to enable LoRA for embedding layers
         scan_layers: Whether to use scan over layers
+        segment_length: Segment length for memory-efficient scan rematerialization (e.g., 8 for 48 layers = 6 segments)
         use_ring_attention: Whether to use ring attention for distributed sequence parallelism
         scan_query_chunk_size: Chunk size for query in blockwise/ring attention
         scan_key_chunk_size: Chunk size for key/value in blockwise/ring attention
@@ -29,6 +30,7 @@ class Qwen3Config(PretrainedConfig):
     attn_lora: bool
     embed_lora: bool
     scan_layers: bool
+    segment_length: int | None
     # Ring attention attributes
     use_ring_attention: bool
     scan_query_chunk_size: int
@@ -44,6 +46,7 @@ class Qwen3Config(PretrainedConfig):
         attn_lora: bool = True,
         embed_lora: bool = True,
         scan_layers: bool = False,
+        segment_length: int | None = None,
         use_ring_attention: bool = False,
         scan_query_chunk_size: int = 512,
         scan_key_chunk_size: int = 512,
@@ -58,6 +61,7 @@ class Qwen3Config(PretrainedConfig):
         self.attn_lora = attn_lora
         self.embed_lora = embed_lora
         self.scan_layers = scan_layers
+        self.segment_length = segment_length
         # Ring attention parameters
         self.use_ring_attention = use_ring_attention
         self.scan_query_chunk_size = scan_query_chunk_size

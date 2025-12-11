@@ -157,9 +157,18 @@ def load_safetensors(
         handle, orig_key = key_to_handle[key]
         return handle.get_tensor(orig_key)
 
-    # Check if model uses scan_layers
+    # Check if model uses scan_layers and segment_length
     scan_layers = getattr(config, "scan_layers", False)
     num_layers = getattr(config, "num_hidden_layers", None)
+    segment_length = getattr(config, "segment_length", None)
+
+    def maybe_reshape_to_segments(tensor: np.ndarray) -> np.ndarray:
+        """Reshape tensor from [num_layers, ...] to [num_segments, segment_length, ...] if segment_length is set."""
+        if segment_length is not None and tensor.shape[0] == num_layers:
+            num_segments = num_layers // segment_length
+            new_shape = (num_segments, segment_length) + tensor.shape[1:]
+            return tensor.reshape(new_shape)
+        return tensor
 
     model_params = nnx.to_flat_state(nnx.state(model))
     for path, param in tqdm(model_params, desc="Loading params"):
@@ -180,10 +189,12 @@ def load_safetensors(
                     layer_tensors.append(np.stack(expert_tensors, axis=0))
                     del expert_tensors
                 tensor = np.stack(layer_tensors, axis=0)
+                tensor = maybe_reshape_to_segments(tensor)
                 del layer_tensors
             else:
                 expert_tensors = [get_tensor(get_expert_key(path, i)).T for i in range(config.num_experts)]
                 tensor = np.stack(expert_tensors, axis=0)
+                # No segment reshape for non-scanned experts
                 del expert_tensors
         elif scan_layers and is_scanned_layer_param(path):
             # For scanned layers: nnx.vmap stacks weights during init, but checkpoint
@@ -195,10 +206,14 @@ def load_safetensors(
                 layer_tensor = layer_tensor if "embed_tokens" in path else layer_tensor.T
                 if path[-2] in {"q_proj", "k_proj", "v_proj", "o_proj"}:
                     # Reshape attention projections per-layer before stacking
-                    target_shape = param.shape[1:]  # Remove layer dim
+                    # If segment_length is set, param.shape is [num_segments, segment_length, ...], skip 2 dims
+                    # Otherwise param.shape is [num_layers, ...], skip 1 dim
+                    skip_dims = 2 if segment_length is not None else 1
+                    target_shape = param.shape[skip_dims:]
                     layer_tensor = layer_tensor.reshape(target_shape)
                 layer_tensors.append(layer_tensor)
             tensor = np.stack(layer_tensors, axis=0)
+            tensor = maybe_reshape_to_segments(tensor)
             del layer_tensors
         else:
             key = get_param_key(path)
