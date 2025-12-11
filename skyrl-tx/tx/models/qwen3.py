@@ -545,8 +545,8 @@ class Qwen3Model(nnx.Module):
 
                 initial_carry = (hidden_states, attention_mask, positions)
 
-                # Wrap entire scan in remat so JAX doesn't save intermediate carries
-                @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
+                # Wrap entire scan in jax.checkpoint so JAX recomputes forward during backward
+                @partial(jax.checkpoint, policy=jax.checkpoint_policies.nothing_saveable)
                 def scanned_layers(carry, layers):
                     return nnx.scan(
                         scan_fn,
