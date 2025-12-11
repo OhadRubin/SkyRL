@@ -566,7 +566,7 @@ class Qwen3Model(nnx.Module):
                     scan_fn,
                     length=num_layers,
                     in_axes=(nnx.Carry, 0),
-                    segment_length=8,
+                    segment_length=3,  # 48/3 = 16 segments
                 )(initial_carry, self.layers)
 
                 hidden_states, _, _ = final_carry
