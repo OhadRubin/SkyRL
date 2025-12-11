@@ -463,8 +463,9 @@ class Qwen3Model(nnx.Module):
             with jax.set_mesh(mesh):
                 self.layers = create_layers()
 
-            # If segment_length is set, reshape layer state from [num_layers, ...] to [num_segments, segment_length, ...]
-            if config.segment_length is not None:
+            # If reshape_for_scan is enabled, reshape layer state from [num_layers, ...] to [num_segments, segment_length, ...]
+            # Otherwise, nnx.scan handles the reshaping internally.
+            if getattr(config, 'reshape_for_scan', False) and config.segment_length is not None:
                 num_segments = config.num_hidden_layers // config.segment_length
                 segment_length = config.segment_length
 
@@ -474,7 +475,6 @@ class Qwen3Model(nnx.Module):
                         return x.reshape(new_shape)
                     return x
 
-                # Get state, reshape, and update
                 state = nnx.state(self.layers)
                 reshaped_state = jax.tree.map(reshape_to_segments, state)
                 nnx.update(self.layers, reshaped_state)
