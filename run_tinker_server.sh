@@ -39,6 +39,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 export JAX_LOG_COMPILES=1
+export JAX_TRACEBACK_FILTERING=off
 sudo chown -R $(whoami) /dev/shm/huggingface_cache
 # Date-based checkpoint path
 DATE=$(date +%Y%m%d)
