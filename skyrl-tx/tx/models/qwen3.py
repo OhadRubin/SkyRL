@@ -461,7 +461,7 @@ class Qwen3Model(nnx.Module):
 
             # Use jax.jit with mesh context to create sharded layers directly
             # JAX will optimize away intermediate allocations and create sharded arrays
-            @jax.jit
+            @nnx.jit
             def create_layers():
                 return create_layer(config, dtype, keys, mesh)
 
