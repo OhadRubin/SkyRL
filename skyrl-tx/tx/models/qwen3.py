@@ -567,6 +567,7 @@ class Qwen3Model(nnx.Module):
                     length=num_layers,
                     in_axes=(nnx.Carry, 0),
                     segment_length=8,  # 6 segments of 8 layers each
+                    segment_broadcast_params=False,  # False=reshape approach, True=dynamic_slice
                 )(initial_carry, self.layers)
 
                 hidden_states, _, _ = final_carry
