@@ -1,10 +1,13 @@
 #!/bin/bash
 # Script to run the Tinker API server on TPU
 
-
 set -e
 
+ts() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+ts "Starting Tinker server script"
 cd ~/SkyRL/skyrl-tx
+ts "Running git pull"
 git pull
 
 # HuggingFace cache configuration (use /dev/shm for fast access)
@@ -41,7 +44,9 @@ done
 export JAX_LOG_COMPILES=1
 export JAX_TRACEBACK_FILTERING=off
 export JAX_DUMP_IR_MODES='jaxpr'
-export JAX_DUMP_IR_TO='/tmp/jax_ir_dump'
+JAX_DUMP_TS=$(date '+%Y%m%d_%H%M%S')
+export JAX_DUMP_IR_TO="/tmp/jax_ir_dump_${JAX_DUMP_TS}"
+ts "JAX IR dump dir: ${JAX_DUMP_IR_TO}"
 export XLA_FLAGS='--xla_disable_hlo_passes=algsimp'
 
 sudo chown -R $(whoami) /dev/shm/huggingface_cache
@@ -67,9 +72,11 @@ PRECOMPILE_SEQ_LENS=""
 
 
 
+ts "Clearing TPU lockfile"
 sudo rm /tmp/libtpu_lockfile || true
 sleep 2
 
+ts "Reinstalling ringattention"
 # Reinstall ringattention to get clean copy, then fix deprecated JAX API
 uv pip install --reinstall ringattention --quiet
 RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/ringattention/__init__.py"
