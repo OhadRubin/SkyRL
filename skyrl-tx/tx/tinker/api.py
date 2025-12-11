@@ -931,6 +931,15 @@ async def root():
 
 
 if __name__ == "__main__":
+    # Fail fast if flax fork with segment_length support is not installed
+    import inspect
+    from flax.nnx import scan
+    if 'segment_length' not in inspect.signature(scan).parameters:
+        raise RuntimeError(
+            "Flax fork with segment_length support not installed. "
+            "Run: pip install --force-reinstall git+https://github.com/OhadRubin/flax@remat-scan-nnx"
+        )
+
     import argparse
     import uvicorn
 
