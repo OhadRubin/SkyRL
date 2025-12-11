@@ -52,6 +52,8 @@ TENSOR_PARALLEL_SIZE=4
 MAX_LORA_ADAPTERS=4
 MAX_LORA_RANK=8
 TRAIN_MICRO_BATCH_SIZE=1
+# Disable algebraic simplification to prevent OOM during compilation
+export XLA_FLAGS='--xla_disable_hlo_passes=algsimp'
 
 # External inference server
 EXTERNAL_INFERENCE_URL="https://v6e-8-node-17.ohadrubin.com"

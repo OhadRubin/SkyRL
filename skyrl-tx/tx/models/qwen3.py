@@ -489,7 +489,7 @@ class Qwen3Model(nnx.Module):
         hidden_states = self.embed_tokens(input_ids)
         all_hidden_states: list[jax.Array] = []
         
-        hidden_states = nn.with_logical_constraint(hidden_states, (("dp","layer"), None, None))
+        # hidden_states = nn.with_logical_constraint(hidden_states, (("dp","layer"), None, None))
 
         if getattr(self.config, "scan_layers", False):
             # Use nnx.scan which handles state propagation and gradient flow correctly
