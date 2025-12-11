@@ -509,9 +509,8 @@ class Qwen3Model(nnx.Module):
                     length=num_layers,  # Explicit length helps XLA recognize this as a loop
                     transform_metadata={nnx.PARTITION_NAME: 'layer'},
                 )
+                @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
                 def apply_layer_with_cache(layer, h, attn_mask, pos, k_cache, v_cache):
-                    # Remat is applied inside Qwen3Attention and Qwen3MLP, not here
-                    # This ensures scan carry flows correctly without 48x broadcast buffers
                     h, (k, v) = layer(
                         h,
                         attention_mask=attn_mask,
@@ -534,9 +533,8 @@ class Qwen3Model(nnx.Module):
                     length=num_layers,  # Explicit length helps XLA recognize this as a loop
                     transform_metadata={nnx.PARTITION_NAME: 'layer'},
                 )
+                @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
                 def apply_layer_no_cache(layer, h, attn_mask, pos):
-                    # Remat is applied inside Qwen3Attention and Qwen3MLP, not here
-                    # This ensures scan carry flows correctly without 48x broadcast buffers
                     input_dtype = h.dtype
                     h, _ = layer(
                         h,
