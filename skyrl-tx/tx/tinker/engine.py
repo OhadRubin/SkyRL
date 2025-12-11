@@ -145,7 +145,7 @@ class TinkerEngine:
         model_class = get_model_class(self.model_config)
 
         # Create model and load weights
-        self.mesh = jax.make_mesh((1, self.config.tensor_parallel_size), ("dp", "tp"))
+        self.mesh = jax.make_mesh((1, 1, self.config.tensor_parallel_size), ("layer", "dp", "tp"))
         with jax.set_mesh(self.mesh):
             self.model = model_class(self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0), mesh=self.mesh)
             load_safetensors(checkpoint_path, self.model_config, self.model)

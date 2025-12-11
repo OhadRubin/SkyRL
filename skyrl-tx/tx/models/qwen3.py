@@ -500,8 +500,8 @@ class Qwen3Model(nnx.Module):
                 stacked_values = jnp.stack(kv_cache.values, axis=0)
                 cache_position = kv_cache.cache_position
 
-                # Use StateAxes with ellipsis to scan ALL state types over axis 0
-                layer_state_axes = nnx.StateAxes({...: 0})
+                # Scan only Params on axis 0, broadcast everything else
+                layer_state_axes = nnx.StateAxes({nnx.Param: 0, ...: None})
 
                 @nnx.scan(
                     in_axes=(layer_state_axes, nnx.Carry, None, None, 0, 0),
@@ -525,9 +525,8 @@ class Qwen3Model(nnx.Module):
                     stacked_keys, stacked_values
                 )
             else:
-                # Use StateAxes with ellipsis to scan ALL state types over axis 0
-                # This ensures every variable (Param, Variable, etc.) is properly sliced per-layer
-                layer_state_axes = nnx.StateAxes({...: 0})
+                # Scan only Params on axis 0, broadcast everything else
+                layer_state_axes = nnx.StateAxes({nnx.Param: 0, ...: None})
 
                 @nnx.scan(
                     in_axes=(layer_state_axes, nnx.Carry, None, None),
