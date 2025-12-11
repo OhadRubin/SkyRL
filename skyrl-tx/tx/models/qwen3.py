@@ -398,16 +398,26 @@ class Qwen3Model(nnx.Module):
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs, mesh=None) -> None:
         self.config = config
 
-        lora_rank = config.lora_rank if getattr(config, "embed_lora", True) else 0
-        self.embed_tokens = LoRAEmbed(
-            num_embeddings=config.vocab_size,
-            features=config.hidden_size,
-            dtype=dtype,
-            lora_rank=lora_rank,
-            param_dtype=dtype,
-            embedding_init=nnx.with_partitioning(nnx.initializers.normal(), ("tp", None)),
-            rngs=rngs,
-        )
+        embed_lora = getattr(config, "embed_lora", True)
+        if embed_lora and config.lora_rank > 0:
+            self.embed_tokens = LoRAEmbed(
+                num_embeddings=config.vocab_size,
+                features=config.hidden_size,
+                dtype=dtype,
+                lora_rank=config.lora_rank,
+                param_dtype=dtype,
+                embedding_init=nnx.with_partitioning(nnx.initializers.normal(), ("tp", None)),
+                rngs=rngs,
+            )
+        else:
+            self.embed_tokens = nnx.Embed(
+                num_embeddings=config.vocab_size,
+                features=config.hidden_size,
+                dtype=dtype,
+                param_dtype=dtype,
+                embedding_init=nnx.with_partitioning(nnx.initializers.normal(), ("tp", None)),
+                rngs=rngs,
+            )
 
         if getattr(config, "scan_layers", False):
             # Use nnx.vmap to create stacked layers, then nnx.scan for forward pass
@@ -568,17 +578,28 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
         self.config = config
         self.model = Qwen3Model(config, dtype=dtype, rngs=rngs, mesh=mesh)
         if not self.config.tie_word_embeddings:
-            lora_rank = config.lora_rank if getattr(config, "embed_lora", True) else 0
-            self.lm_head = LoRALinear(
-                config.hidden_size,
-                config.vocab_size,
-                use_bias=False,
-                dtype=dtype,
-                param_dtype=dtype,
-                kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
-                lora_rank=lora_rank,
-                rngs=rngs,
-            )
+            embed_lora = getattr(config, "embed_lora", True)
+            if embed_lora and config.lora_rank > 0:
+                self.lm_head = LoRALinear(
+                    config.hidden_size,
+                    config.vocab_size,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=dtype,
+                    kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
+                    lora_rank=config.lora_rank,
+                    rngs=rngs,
+                )
+            else:
+                self.lm_head = nnx.Linear(
+                    config.hidden_size,
+                    config.vocab_size,
+                    use_bias=False,
+                    dtype=dtype,
+                    param_dtype=dtype,
+                    kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
+                    rngs=rngs,
+                )
 
     @staticmethod
     def is_lora_param(path: tuple, _value) -> bool:
