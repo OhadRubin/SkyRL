@@ -130,7 +130,7 @@ class Qwen3Attention(nnx.Module):
             and self.mesh is not None
             and kv_cache is None  # Ring attention only for training, not inference
         )
-        use_ring = False
+        use_ring = True
         use_flash = False
 
         if use_ring:
