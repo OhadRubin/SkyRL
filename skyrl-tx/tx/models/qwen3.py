@@ -428,7 +428,7 @@ class Qwen3Model(nnx.Module):
 
             @nnx.vmap(
                 in_axes=(None, None, 0, None),  # keys vectorized on axis 0, mesh is static
-                out_axes=0,  # All module state stacked on axis 0
+                out_axes=nnx.StateAxes({...: 0}),  # All module state stacked on axis 0
                 transform_metadata={nnx.PARTITION_NAME: None},  # Layer axis not sharded
             )
             def create_layer(cfg, dt, key, msh):
@@ -512,7 +512,7 @@ class Qwen3Model(nnx.Module):
 
                 @nnx.scan(
                     in_axes=(layer_state_axes, nnx.Carry, None, None),
-                    out_axes=(nnx.Carry, (0, 0)),
+                    out_axes=nnx.Carry,  # Only carry hidden_states, discard KV to save memory
                     length=num_layers,  # Explicit length helps XLA recognize this as a loop
                     transform_metadata={nnx.PARTITION_NAME: None},
                 )
@@ -528,18 +528,18 @@ class Qwen3Model(nnx.Module):
                             positions=pos,
                             kv_cache=None,
                         )
-                    h, (k, v) = layer_forward(layer, h)
+                    h, _ = layer_forward(layer, h)  # Discard KV outputs
                     # Ensure output dtype matches input dtype for scan compatibility
                     h = h.astype(input_dtype)
-                    return h, (k, v)
+                    return h
 
-                hidden_states, (updated_keys, updated_values) = apply_layer_no_cache(
+                hidden_states = apply_layer_no_cache(
                     self.layers, hidden_states, attention_mask, positions
                 )
 
-            # Convert stacked arrays to lists for KVCache
-            updated_keys = [updated_keys[i] for i in range(num_layers)]
-            updated_values = [updated_values[i] for i in range(num_layers)]
+            # No KV cache needed during training (scan without cache)
+            updated_keys = []
+            updated_values = []
 
         else:
             # Original for-loop based forward pass
