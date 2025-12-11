@@ -546,10 +546,8 @@ class Qwen3Model(nnx.Module):
                 final_carry, _ = nnx.scan(
                     scan_fn,
                     length=num_layers,
-                    # in_axes=(nnx.Carry, layer_state_axes),
                     in_axes=(nnx.Carry, 0),
-                    out_axes=(nnx.Carry, 0),
-                    # transform_metadata={nnx.PARTITION_NAME: 'layer'},
+                    out_axes=(nnx.Carry, None),  # None = don't stack the second output
                 )(initial_carry, self.layers)
 
                 hidden_states, _, _ = final_carry

@@ -42,6 +42,8 @@ export JAX_LOG_COMPILES=1
 export JAX_TRACEBACK_FILTERING=off
 export JAX_DUMP_IR_MODES='jaxpr'
 export JAX_DUMP_IR_TO='/tmp/jax_ir_dump'
+export XLA_FLAGS='--xla_disable_hlo_passes=algsimp'
+
 sudo chown -R $(whoami) /dev/shm/huggingface_cache
 # Date-based checkpoint path
 DATE=$(date +%Y%m%d)
@@ -55,7 +57,7 @@ MAX_LORA_ADAPTERS=4
 MAX_LORA_RANK=8
 TRAIN_MICRO_BATCH_SIZE=1
 # Disable algebraic simplification to prevent OOM during compilation
-export XLA_FLAGS='--xla_disable_hlo_passes=algsimp'
+
 
 # External inference server
 EXTERNAL_INFERENCE_URL="https://v6e-8-node-17.ohadrubin.com"
