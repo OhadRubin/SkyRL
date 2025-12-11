@@ -133,12 +133,18 @@ def load_safetensors(
     skip_lora: bool = True,
     prefix: str = "",
     filter_fn: Callable[[tuple], bool] | None = None,
+    reshape_for_scan: bool = False,
 ) -> None:
     """Load safetensors with streaming to reduce peak memory usage.
 
     Uses safetensors.safe_open for lazy loading - tensors are only loaded into
     memory when accessed. Updates model parameters incrementally to minimize
     device memory usage (only 1 extra tensor on device at a time).
+
+    Args:
+        reshape_for_scan: If True and segment_length is set, reshape stacked layer
+            weights from [num_layers, ...] to [num_segments, segment_length, ...].
+            Set to False if nnx.scan handles the reshaping internally.
     """
     # Build index: map each key to its file handle (lazy loading)
     file_handles = []
@@ -164,7 +170,7 @@ def load_safetensors(
 
     def maybe_reshape_to_segments(tensor: np.ndarray) -> np.ndarray:
         """Reshape tensor from [num_layers, ...] to [num_segments, segment_length, ...] if segment_length is set."""
-        if segment_length is not None and tensor.shape[0] == num_layers:
+        if reshape_for_scan and segment_length is not None and tensor.shape[0] == num_layers:
             num_segments = num_layers // segment_length
             new_shape = (num_segments, segment_length) + tensor.shape[1:]
             return tensor.reshape(new_shape)
