@@ -545,16 +545,14 @@ class Qwen3Model(nnx.Module):
 
                 initial_carry = (hidden_states, attention_mask, positions)
 
-                # Wrap entire scan in jax.checkpoint so JAX recomputes forward during backward
-                @partial(jax.checkpoint, policy=jax.checkpoint_policies.nothing_saveable)
-                def scanned_layers(carry, layers):
-                    return nnx.scan(
-                        scan_fn,
-                        length=num_layers,
-                        in_axes=(nnx.Carry, 0),
-                    )(carry, layers)
-
-                final_carry, _ = scanned_layers(initial_carry, self.layers)
+                # Use segment_length for memory-efficient rematerialization
+                # With 48 layers and segment_length=8, saves 6 boundary states instead of 48
+                final_carry, _ = nnx.scan(
+                    scan_fn,
+                    length=num_layers,
+                    in_axes=(nnx.Carry, 0),
+                    segment_length=8,
+                )(initial_carry, self.layers)
 
                 hidden_states, _, _ = final_carry
 
