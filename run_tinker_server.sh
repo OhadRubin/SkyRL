@@ -79,6 +79,7 @@ sleep 2
 ts "Reinstalling ringattention"
 # Reinstall ringattention to get clean copy, then fix deprecated JAX API
 uv pip install --reinstall ringattention --quiet
+rm -f uv.lock  # Remove lockfile to always get latest from git
 uv sync --extra tpu --extra tinker --refresh-package flax
 RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/ringattention/__init__.py"
 sed -i 's/jax.lib.xla_bridge.get_backend/jax.extend.backend.get_backend/' "$RING_INIT"
