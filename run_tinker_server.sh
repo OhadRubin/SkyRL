@@ -47,7 +47,7 @@ export JAX_DUMP_IR_MODES='jaxpr'
 JAX_DUMP_TS=$(date '+%Y%m%d_%H%M%S')
 export JAX_DUMP_IR_TO="/tmp/jax_ir_dump_${JAX_DUMP_TS}"
 ts "JAX IR dump dir: ${JAX_DUMP_IR_TO}"
-export XLA_FLAGS='--xla_disable_hlo_passes=algsimp'
+# export XLA_FLAGS='--xla_disable_hlo_passes=algsimp'
 
 sudo chown -R $(whoami) /dev/shm/huggingface_cache
 # Date-based checkpoint path
