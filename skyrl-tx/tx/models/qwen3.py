@@ -105,6 +105,22 @@ class Qwen3Attention(nnx.Module):
         positions: jax.Array,
         kv_cache: tuple[jax.Array, jax.Array, int] | None = None,
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+        # Remat the attention computation to save memory during backward pass
+        # This is applied here (inside the layer) rather than around the whole layer
+        # to ensure scan carry flows correctly without 48x broadcast buffers
+        @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
+        def _attention_forward(self, x, attention_mask, positions, kv_cache):
+            return self._forward(x, attention_mask=attention_mask, positions=positions, kv_cache=kv_cache)
+        return _attention_forward(self, x, attention_mask, positions, kv_cache)
+
+    def _forward(
+        self,
+        x: jax.Array,
+        *,
+        attention_mask: jax.Array,
+        positions: jax.Array,
+        kv_cache: tuple[jax.Array, jax.Array, int] | None = None,
+    ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
         B, T, _ = x.shape
 
         # Project and reshape to [B, T, num_heads, head_dim]
@@ -272,9 +288,15 @@ class Qwen3MLP(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        gate_out = self.gate_proj(x)
-        up_out = self.up_proj(x)
-        return self.down_proj(nnx.silu(gate_out) * up_out)
+        # Remat the MLP computation to save memory during backward pass
+        # This is applied here (inside the layer) rather than around the whole layer
+        # to ensure scan carry flows correctly without 48x broadcast buffers
+        @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
+        def _mlp_forward(self, x):
+            gate_out = self.gate_proj(x)
+            up_out = self.up_proj(x)
+            return self.down_proj(nnx.silu(gate_out) * up_out)
+        return _mlp_forward(self, x)
 
 
 class Qwen3Experts(nnx.Module):
@@ -488,17 +510,14 @@ class Qwen3Model(nnx.Module):
                     transform_metadata={nnx.PARTITION_NAME: None},
                 )
                 def apply_layer_with_cache(layer, h, attn_mask, pos, k_cache, v_cache):
-                    # Use remat to recompute forward during backward - saves O(num_layers) memory
-                    # prevent_cse=False allows XLA to optimize repeated computations in scan
-                    @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
-                    def layer_forward(layer, h):
-                        return layer(
-                            h,
-                            attention_mask=attn_mask,
-                            positions=pos,
-                            kv_cache=(k_cache, v_cache, cache_position),
-                        )
-                    h, (k, v) = layer_forward(layer, h)
+                    # Remat is applied inside Qwen3Attention and Qwen3MLP, not here
+                    # This ensures scan carry flows correctly without 48x broadcast buffers
+                    h, (k, v) = layer(
+                        h,
+                        attention_mask=attn_mask,
+                        positions=pos,
+                        kv_cache=(k_cache, v_cache, cache_position),
+                    )
                     return h, (k, v)
 
                 hidden_states, (updated_keys, updated_values) = apply_layer_with_cache(
@@ -517,18 +536,15 @@ class Qwen3Model(nnx.Module):
                     transform_metadata={nnx.PARTITION_NAME: None},
                 )
                 def apply_layer_no_cache(layer, h, attn_mask, pos):
+                    # Remat is applied inside Qwen3Attention and Qwen3MLP, not here
+                    # This ensures scan carry flows correctly without 48x broadcast buffers
                     input_dtype = h.dtype
-                    # Use remat to recompute forward during backward - saves O(num_layers) memory
-                    # prevent_cse=False allows XLA to optimize repeated computations in scan
-                    @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
-                    def layer_forward(layer, h):
-                        return layer(
-                            h,
-                            attention_mask=attn_mask,
-                            positions=pos,
-                            kv_cache=None,
-                        )
-                    h, _ = layer_forward(layer, h)  # Discard KV outputs
+                    h, _ = layer(
+                        h,
+                        attention_mask=attn_mask,
+                        positions=pos,
+                        kv_cache=None,
+                    )
                     # Ensure output dtype matches input dtype for scan compatibility
                     h = h.astype(input_dtype)
                     return h
