@@ -15,6 +15,7 @@ class Qwen3Config(PretrainedConfig):
         shard_attention_heads: Whether to shard attention across tensor parallel devices
         mlp_lora: Whether to enable LoRA for MLP layers
         attn_lora: Whether to enable LoRA for attention layers
+        embed_lora: Whether to enable LoRA for embedding layers
         scan_layers: Whether to use scan over layers
         use_ring_attention: Whether to use ring attention for distributed sequence parallelism
         scan_query_chunk_size: Chunk size for query in blockwise/ring attention
@@ -26,6 +27,7 @@ class Qwen3Config(PretrainedConfig):
     shard_attention_heads: bool
     mlp_lora: bool
     attn_lora: bool
+    embed_lora: bool
     scan_layers: bool
     # Ring attention attributes
     use_ring_attention: bool
@@ -40,6 +42,7 @@ class Qwen3Config(PretrainedConfig):
         shard_attention_heads: bool = True,
         mlp_lora: bool = True,
         attn_lora: bool = True,
+        embed_lora: bool = True,
         scan_layers: bool = False,
         use_ring_attention: bool = False,
         scan_query_chunk_size: int = 512,
@@ -53,6 +56,7 @@ class Qwen3Config(PretrainedConfig):
         self.shard_attention_heads = shard_attention_heads
         self.mlp_lora = mlp_lora
         self.attn_lora = attn_lora
+        self.embed_lora = embed_lora
         self.scan_layers = scan_layers
         # Ring attention parameters
         self.use_ring_attention = use_ring_attention

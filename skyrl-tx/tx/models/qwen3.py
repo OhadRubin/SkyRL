@@ -398,7 +398,7 @@ class Qwen3Model(nnx.Module):
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs, mesh=None) -> None:
         self.config = config
 
-        lora_rank = config.lora_rank
+        lora_rank = config.lora_rank if getattr(config, "embed_lora", True) else 0
         self.embed_tokens = LoRAEmbed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
@@ -455,12 +455,7 @@ class Qwen3Model(nnx.Module):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        # Remat the embedding to avoid saving large vocab-sized intermediates during backward
-        @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=True)
-        def embed_forward(embed_tokens, ids):
-            return embed_tokens(ids)
-
-        hidden_states = embed_forward(self.embed_tokens, input_ids)
+        hidden_states = self.embed_tokens(input_ids)
         all_hidden_states: list[jax.Array] = []
 
         if getattr(self.config, "scan_layers", False):
@@ -573,7 +568,7 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
         self.config = config
         self.model = Qwen3Model(config, dtype=dtype, rngs=rngs, mesh=mesh)
         if not self.config.tie_word_embeddings:
-            lora_rank = config.lora_rank
+            lora_rank = config.lora_rank if getattr(config, "embed_lora", True) else 0
             self.lm_head = LoRALinear(
                 config.hidden_size,
                 config.vocab_size,
@@ -611,19 +606,10 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
         )
         hidden_states = outputs.last_hidden_state
 
-        # Remat the lm_head to avoid saving large vocab-sized intermediates during backward
         if self.config.tie_word_embeddings:
-            @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=True)
-            def lm_head_forward(embed_tokens, h):
-                return h @ embed_tokens.embedding.value.T
-
-            logits = lm_head_forward(self.model.embed_tokens, hidden_states)
+            logits = hidden_states @ self.model.embed_tokens.embedding.value.T
         else:
-            @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=True)
-            def lm_head_forward(lm_head, h):
-                return lm_head(h)
-
-            logits = lm_head_forward(self.lm_head, hidden_states)
+            logits = self.lm_head(hidden_states)
 
         return CausalLMOutput(
             logits=logits,

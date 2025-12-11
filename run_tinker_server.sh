@@ -78,6 +78,7 @@ uv run --extra tinker --extra tpu  -m tx.tinker.api \
     --tensor-parallel-size ${TENSOR_PARALLEL_SIZE} \
     --max-lora-adapters ${MAX_LORA_ADAPTERS} \
     --no-mlp-lora \
+    --no-embed-lora \
     --max-lora-rank ${MAX_LORA_RANK} \
     --train-micro-batch-size ${TRAIN_MICRO_BATCH_SIZE} \
     --external-inference-url "${EXTERNAL_INFERENCE_URL}" \

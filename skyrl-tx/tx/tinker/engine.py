@@ -135,6 +135,7 @@ class TinkerEngine:
             shard_attention_heads=self.config.shard_attention_heads,
             mlp_lora=self.config.mlp_lora,
             attn_lora=self.config.attn_lora,
+            embed_lora=self.config.embed_lora,
             scan_layers=self.config.scan_layers,
             use_ring_attention=self.config.use_ring_attention,
             scan_query_chunk_size=self.config.scan_query_chunk_size,
