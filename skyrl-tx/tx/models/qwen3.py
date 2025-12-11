@@ -455,7 +455,12 @@ class Qwen3Model(nnx.Module):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        hidden_states = self.embed_tokens(input_ids)
+        # Remat the embedding to avoid saving large vocab-sized intermediates during backward
+        @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
+        def embed_forward(embed_tokens, ids):
+            return embed_tokens(ids)
+
+        hidden_states = embed_forward(self.embed_tokens, input_ids)
         all_hidden_states: list[jax.Array] = []
 
         if getattr(self.config, "scan_layers", False):
@@ -605,10 +610,20 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
             kv_cache=kv_cache,
         )
         hidden_states = outputs.last_hidden_state
+
+        # Remat the lm_head to avoid saving large vocab-sized intermediates during backward
         if self.config.tie_word_embeddings:
-            logits = hidden_states @ self.model.embed_tokens.embedding.value.T
+            @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
+            def lm_head_forward(embed_tokens, h):
+                return h @ embed_tokens.embedding.value.T
+
+            logits = lm_head_forward(self.model.embed_tokens, hidden_states)
         else:
-            logits = self.lm_head(hidden_states)
+            @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
+            def lm_head_forward(lm_head, h):
+                return lm_head(h)
+
+            logits = lm_head_forward(self.lm_head, hidden_states)
 
         return CausalLMOutput(
             logits=logits,
