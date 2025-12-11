@@ -790,71 +790,160 @@ The following files in `/Users/ohadr/tinker-cookbook/` contain extracted Flax so
 
 ---
 
-## PLAN: Pre-reshape Weights to Segment Format
+y/closed_call/checkpoint/rematted_computation/mul"                                                 
+                        
+source_file="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/flax/nnx/transforms/gene
+ral.py"              
+source_line=153 source_end_line=153 source_column=30 source_end_column=30                          
+                     
+     Shape: f32[524288,192]{1,0:T(8,128)}                    
+     Unpadded size: 384.00M                                                                        
+                        
+     Extra memory due to padding: 128.00M (1.3x expansion)   
+     XLA label: fusion.887 = fusion(ragged-dot-none.6, ragged-dot-none.7, ragged-dot-none.8), 
+kind=kLoop,               
+calls=fused_computation.311.clone.clone                     
+     Allocation type: HLO temp                               
+     ========================== 
 
-### Problem
-After implementing `segment_length=8` in nnx.scan, XLA still allocates 6GB+ for MoE weights because:
-1. Weights are loaded/stored as `[48, 128, 2048, 768]` (48 layers stacked)
-2. Inside the scan, they get reshaped to `[6, 8, 128, 2048, 768]` (6 segments × 8 layers)
-3. XLA keeps **both** copies in memory
+⏺ Looking at your memory profile output - I can see the nested checkpoint structure is working
+  (checkpoint/while/body/closed_call/checkpoint/while).
 
-### Solution
-Pre-reshape weights to segment format `[num_segments, segment_length, ...]` so XLA only holds one copy.
+  Let me check if nnx.Variable/nnx.Param is a pytree and how its value is exposed:
 
-### Implementation Plan
+⏺ Search(pattern: "register_pytree.*Variable|class Variable", path: "flax/nnx/variablelib.py",
+        output_mode: "content")
+  ⎿  Found 178 lines (ctrl+o to expand)
 
-#### 1. Add `segment_length` to Qwen3Config
-```python
-# tx/models/configs.py
-class Qwen3Config:
-    scan_layers: bool = False
-    segment_length: int | None = None  # NEW: e.g., 8 for 48/8=6 segments
-```
+⏺ I see - the State contains Param objects, not raw arrays. Let me find how Variable is registered
+  as a pytree:
 
-#### 2. Reshape in model `__init__` (for fresh models)
-```python
-# tx/models/qwen3.py - in Qwen3Model.__init__ after creating layers
-if config.scan_layers and config.segment_length:
-    num_segments = config.num_hidden_layers // config.segment_length
-    # Reshape self.layers state from [48,...] to [6,8,...]
-    # This affects: layers.mlp.experts.{up_proj,gate_proj,down_proj}.value
-    #               layers.self_attn.{q,k,v,o}_proj.{kernel,lora_a,lora_b}
-    #               layers.{input,post_attention}_layernorm.scale
-```
+⏺ Search(pattern: "register_pytree|_flatten|__flatten"", path: "flax/nnx/variablelib.py", output_mode:
+        "content")
+  ⎿  Found 50 lines (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
 
-#### 3. Reshape at checkpoint load time
-```python
-# tx/utils/models.py - in load_safetensors()
-def load_safetensors(..., segment_length: int | None = None):
-    # When loading tensor with shape [48, ...]:
-    if segment_length and tensor.shape[0] == config.num_hidden_layers:
-        num_segments = tensor.shape[0] // segment_length
-        new_shape = (num_segments, segment_length) + tensor.shape[1:]
-        tensor = tensor.reshape(new_shape)
-```
 
-#### 4. Update scan to expect pre-segmented weights
-```python
-# tx/models/qwen3.py - in forward pass
-# Currently: nnx.scan reshapes [48,...] → [6,8,...] internally
-# After: weights already in [6,8,...], scan just uses them directly
-```
+> how will this solve the parameter out of memory issue? 
 
-### Files to Modify
-| File | Change |
-|------|--------|
-| `tx/models/configs.py` | Add `segment_length` to Qwen3Config |
-| `tx/models/qwen3.py` | Reshape layers in `__init__`, update scan logic |
-| `tx/utils/models.py` | Reshape tensors in `load_safetensors` |
-| `tx/tinker/engine.py` | Pass `segment_length` to model/loader |
+                                                                                          
+                                                                                                                                                                
+Program hbm requirement 30.47G:                                                                                                                                 
+    global           224.5K                                                                                                                                     
+    scoped            3.87M                                                                                                                                     
+    HLO temp         30.47G (86.4% utilization: Unpadded (22.68G) Padded (26.24G), 13.9% fragmentation (4.23G))                                                 
+                                                                                                                                                                
+  Largest program allocations in hbm:                                                                                                                           
+                                                                                                                                                                
+  1. Size: 6.00G                                                                                                                                                
+     Operator: op_name="model.model.layers.mlp.experts.up_proj.value"                                                                                           
+     Shape: bf16[48,128,2048,192]{3,2,1,0:T(8,128)(2,1)}                                                                                                        
+     Unpadded size: 4.50G                                                                                                                                       
+     Extra memory due to padding: 1.50G (1.3x expansion)                                                                                                        
+     XLA label: copy.317 = copy(param.39), sharding={devices=[1,1,1,4]<=[4]}                                                                                    
+     Allocation type: HLO temp                                                                                                                                  
+     ==========================                                                                                                                                 
+                                                                                                                                                                
+  2. Size: 6.00G                                                                                                                                                
+     Operator: op_name="model.model.layers.mlp.experts.gate_proj.value"                                                                                         
+     Shape: bf16[48,128,2048,192]{3,2,1,0:T(8,128)(2,1)}                                                                                                        
+     Unpadded size: 4.50G                                                                                                                                       
+     Extra memory due to padding: 1.50G (1.3x expansion)                                                                                                        
+     XLA label: copy.316 = copy(param.38), sharding={devices=[1,1,1,4]<=[4]}                                                                                    
+     Allocation type: HLO temp                                                                                                                                  
+     ==========================                                                                                                                                 
+                                                                                                                                                                
+  3. Size: 4.00G                                                                                                                                                
+     Operator:                                                                                                                                                  
+op_name="jit(forward_backward_and_accumulate)/transpose(jvp())/while/body/closed_call/checkpoint/while/body/closed_call/checkpoint/rematted_comput              
+ation/ragged_dot_general" source_file="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/flax/nnx/transforms/general.py"                            
+source_line=153 source_end_line=153 source_column=30 source_end_column=30                                                                                       
+     Shape: f32[524288,2048]{1,0:T(8,128)}                                                                                                                      
+     Unpadded size: 4.00G                                                                                                                                       
+     XLA label: all-reduce.55 = all-reduce(ragged-dot-none.11), channel_id=11, replica_groups=[1,4]<=[4], use_global_device_ids=true,                           
+to_apply=add.10.clone                                                                                                                                           
+     Allocation type: HLO temp                                                                                                                                  
+     ==========================                                                                                                                                 
+                                                                                                                                                                
+  1. Size: 4.00G                                                                                                                                                
+     Operator:                                                                                                                                                  
+op_name="jit(forward_backward_and_accumulate)/transpose(jvp())/while/body/closed_call/checkpoint/while/body/closed_call/checkpoint/rematted_comput              
+ation/gather" source_file="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/flax/nnx/transforms/general.py" source_line=153                        
+source_end_line=153 source_column=30 source_end_column=30                                                                                                       
+     Shape: f32[524288,2048]{1,0:T(8,128)}                                                                                                                      
+     Unpadded size: 4.00G                                                                                                                                       
+     XLA label: fusion.889 = fusion(all-reduce.55, copy-done.62), kind=kCustom, calls=fused_computation.3.clone.clone                                           
+     Allocation type: HLO temp                                                                                                                                  
+     ==========================         
 
-### Expected Memory Savings
-- Before: XLA holds `[48,128,2048,768]` + `[6,8,128,2048,768]` = ~9GB for up_proj alone
-- After: XLA holds only `[6,8,128,2048,768]` = ~4.5GB
-- Total savings: ~12GB (for up_proj + gate_proj)
+  1. Size: 1.00G                        
+     Operator: op_name="jit(forward_backward_and_accumulate)/transpose(jvp())/while/body/squeeze"                                                               
+source_file="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/flax/nnx/transforms/iteration.py" source_line=1403 source_end_line=1403              
+source_column=38 source_end_column=38   
+     Shape: bf16[8,128,2048,192]{3,2,1,0:T(8,128)(2,1)}                         
+     Unpadded size: 768.00M             
+     Extra memory due to padding: 256.00M (1.3x expansion)                      
+     XLA label: dynamic-slice_bitcast_fusion.98 = fusion(get-tuple-element.6014, sub.319, get-tuple-element.6013), kind=kLoop,                                  
+calls=fused_computation.543.clone.clone 
+     Allocation type: HLO temp          
+     ==========================         
 
-### Verification
-1. Check jaxpr no longer has `[48,...]` shapes for layer weights
-2. Memory profile should not show 6GB copies for MoE weights
-3. Training should complete without OOM on 65k seq length
+  1. Size: 768.00M                      
+     Operator: op_name="jit(forward_backward_and_accumulate)/transpose(jvp())/while/body/squeeze"                                                               
+source_file="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/flax/nnx/transforms/iteration.py" source_line=1403 source_end_line=1403              
+source_column=38 source_end_column=38   
+     Shape: bf16[8,128,192,2048]{3,2,1,0:T(8,128)(2,1)}                         
+     Unpadded size: 768.00M             
+     XLA label: dynamic-slice_bitcast_fusion.99 = fusion(get-tuple-element.6012, sub.319), kind=kLoop, calls=fused_computation.545.clone.clone                  
+     Allocation type: HLO temp          
+     ==========================         
 
+  1. Size: 768.00M                      
+  2. 
+
+
+
+  The core issue from your memory profile:
+  - Parameters: 6GB × 2 = 12GB (the actual weights - unavoidable)
+  - .remat_compressed copies: 4.5GB × 2 = 9GB (the extra copies - this is the problem)
+
+  jax.checkpoint is supposed to reduce activation memory (hidden states), not parameter memory.
+  Parameters are inputs to the function, and inputs should NOT be saved by checkpoint - they flow
+  in from the outer computation.
+
+  So why is XLA creating .remat_compressed copies of parameters? I don't actually know.
+  Possibilities:
+  1. The outer jax.lax.scan's VJP is somehow causing copies
+  2. XLA is making optimization decisions we don't understand
+  3. The nested scan structure is causing something unexpected
+
+  Moving process_segment outside the loop was following Linen's pattern, but it might not address
+  the parameter copy issue.
+
+  Let me look at what's actually different about how Linen handles parameters vs how we're handling
+   them:
+
+⏺ Read(flax/core/lift.py)
+  ⎿  Read 60 lines
+
+⏺ Looking at this more carefully, I see the fundamental difference:
+
+  Linen's approach: Parameters are accessed through the scope, not passed as explicit scan
+  arguments. The scope provides access to the right slice per iteration.
+
+  My NNX approach: Parameters are in scan_in and get sliced by jax.lax.scan per iteration.
+
+  The issue is that putting parameters in the scan's sliced inputs might cause XLA to create copies
+   for the backward pass.
+
+  What if we DON'T scan over parameters? Instead:
+  1. Keep full parameters as a "broadcast" value (not sliced by outer scan)
+  2. Manually slice inside each iteration to get the segment we need
+
+⏺ Read(flax/nnx/transforms/iteration.py)
+  ⎿  Read 70 lines
+
+⏺ Let me look more closely at how axes_scan.scan handles broadcast values differently:
+
+⏺ Read(flax/core/axes_scan.py)
+  ⎿  Read 112 lines
