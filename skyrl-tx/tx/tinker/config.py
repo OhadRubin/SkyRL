@@ -68,6 +68,7 @@ class EngineConfig(BaseModel):
     segment_length: int | None = Field(
         default=None,
         description="Segment length for memory-efficient scan rematerialization (e.g., 8 for 48 layers = 6 segments). Requires scan_layers=True.",
+        json_schema_extra={"argparse_type": int},
     )
     min_seq_len: int = Field(
         default=32,
