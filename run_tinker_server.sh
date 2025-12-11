@@ -77,7 +77,7 @@ sudo rm /tmp/libtpu_lockfile || true
 sleep 2
 
 ts "Reinstalling flax fork with segment_length support"
-.venv/bin/pip install --force-reinstall --no-cache-dir git+https://github.com/OhadRubin/flax@remat-scan-nnx
+~/SkyRL/skyrl-tx/.venv/bin/pip install --force-reinstall --no-cache-dir git+https://github.com/OhadRubin/flax@remat-scan-nnx
 
 ts "Reinstalling ringattention"
 # Reinstall ringattention to get clean copy, then fix deprecated JAX API
