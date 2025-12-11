@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# export JAX_LOG_COMPILES=1
+export JAX_LOG_COMPILES=1
 sudo chown -R $(whoami) /dev/shm/huggingface_cache
 # Date-based checkpoint path
 DATE=$(date +%Y%m%d)
