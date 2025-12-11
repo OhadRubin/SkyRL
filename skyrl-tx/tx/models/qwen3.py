@@ -13,7 +13,7 @@ from tx.layers.util import Param, prepare_routing
 from tx.models.configs import Qwen3Config
 from tx.models.types import CausalLMOutput, ModelOutput
 from tx.utils.generator import GeneratorMixin, KVCache, compute_positions
-
+import flax.linen as nn
 
 class RMSNorm(nnx.Module):
     def __init__(self, size: int, *, eps: float = 1e-6, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
@@ -478,12 +478,18 @@ class Qwen3Model(nnx.Module):
         output_hidden_states: bool | None = None,
         kv_cache: KVCache | None = None,
     ) -> ModelOutput:
+        
+        
+        
+        
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         hidden_states = self.embed_tokens(input_ids)
         all_hidden_states: list[jax.Array] = []
+        
+        hidden_states = nn.with_logical_constraint(hidden_states, (("dp","layer"), None, None))
 
         if getattr(self.config, "scan_layers", False):
             # Use nnx.scan which handles state propagation and gradient flow correctly
