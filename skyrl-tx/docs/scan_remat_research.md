@@ -788,3 +788,73 @@ The following files in `/Users/ohadr/tinker-cookbook/` contain extracted Flax so
 | `blogpost.md` | Original OOM error analysis |
 | `solution.md` | Working scan patterns from Flax tests |
 
+---
+
+## PLAN: Pre-reshape Weights to Segment Format
+
+### Problem
+After implementing `segment_length=8` in nnx.scan, XLA still allocates 6GB+ for MoE weights because:
+1. Weights are loaded/stored as `[48, 128, 2048, 768]` (48 layers stacked)
+2. Inside the scan, they get reshaped to `[6, 8, 128, 2048, 768]` (6 segments × 8 layers)
+3. XLA keeps **both** copies in memory
+
+### Solution
+Pre-reshape weights to segment format `[num_segments, segment_length, ...]` so XLA only holds one copy.
+
+### Implementation Plan
+
+#### 1. Add `segment_length` to Qwen3Config
+```python
+# tx/models/configs.py
+class Qwen3Config:
+    scan_layers: bool = False
+    segment_length: int | None = None  # NEW: e.g., 8 for 48/8=6 segments
+```
+
+#### 2. Reshape in model `__init__` (for fresh models)
+```python
+# tx/models/qwen3.py - in Qwen3Model.__init__ after creating layers
+if config.scan_layers and config.segment_length:
+    num_segments = config.num_hidden_layers // config.segment_length
+    # Reshape self.layers state from [48,...] to [6,8,...]
+    # This affects: layers.mlp.experts.{up_proj,gate_proj,down_proj}.value
+    #               layers.self_attn.{q,k,v,o}_proj.{kernel,lora_a,lora_b}
+    #               layers.{input,post_attention}_layernorm.scale
+```
+
+#### 3. Reshape at checkpoint load time
+```python
+# tx/utils/models.py - in load_safetensors()
+def load_safetensors(..., segment_length: int | None = None):
+    # When loading tensor with shape [48, ...]:
+    if segment_length and tensor.shape[0] == config.num_hidden_layers:
+        num_segments = tensor.shape[0] // segment_length
+        new_shape = (num_segments, segment_length) + tensor.shape[1:]
+        tensor = tensor.reshape(new_shape)
+```
+
+#### 4. Update scan to expect pre-segmented weights
+```python
+# tx/models/qwen3.py - in forward pass
+# Currently: nnx.scan reshapes [48,...] → [6,8,...] internally
+# After: weights already in [6,8,...], scan just uses them directly
+```
+
+### Files to Modify
+| File | Change |
+|------|--------|
+| `tx/models/configs.py` | Add `segment_length` to Qwen3Config |
+| `tx/models/qwen3.py` | Reshape layers in `__init__`, update scan logic |
+| `tx/utils/models.py` | Reshape tensors in `load_safetensors` |
+| `tx/tinker/engine.py` | Pass `segment_length` to model/loader |
+
+### Expected Memory Savings
+- Before: XLA holds `[48,128,2048,768]` + `[6,8,128,2048,768]` = ~9GB for up_proj alone
+- After: XLA holds only `[6,8,128,2048,768]` = ~4.5GB
+- Total savings: ~12GB (for up_proj + gate_proj)
+
+### Verification
+1. Check jaxpr no longer has `[48,...]` shapes for layer weights
+2. Memory profile should not show 6GB copies for MoE weights
+3. Training should complete without OOM on 65k seq length
+
