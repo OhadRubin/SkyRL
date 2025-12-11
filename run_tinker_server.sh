@@ -24,7 +24,7 @@ MIN_SEQ_LEN=65536
 while [[ $# -gt 0 ]]; do
     case $1 in
         --scan-layers)
-            ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --scan-layers"
+            ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --scan-layers --segment-length 8"
             shift
             ;;
         --log-file)

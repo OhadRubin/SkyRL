@@ -65,6 +65,10 @@ class EngineConfig(BaseModel):
         default=False,
         description="Use scan over layers to reduce compilation graph size (reduces TPU HBM usage during compilation)",
     )
+    segment_length: int | None = Field(
+        default=None,
+        description="Segment length for memory-efficient scan rematerialization (e.g., 8 for 48 layers = 6 segments). Requires scan_layers=True.",
+    )
     min_seq_len: int = Field(
         default=32,
         description="Minimum sequence length for padding buckets (sequences shorter than this are padded up to this length)",

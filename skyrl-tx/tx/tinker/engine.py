@@ -137,6 +137,7 @@ class TinkerEngine:
             attn_lora=self.config.attn_lora,
             embed_lora=self.config.embed_lora,
             scan_layers=self.config.scan_layers,
+            segment_length=self.config.segment_length,
             use_ring_attention=self.config.use_ring_attention,
             scan_query_chunk_size=self.config.scan_query_chunk_size,
             scan_key_chunk_size=self.config.scan_key_chunk_size,
