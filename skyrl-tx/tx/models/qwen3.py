@@ -19,7 +19,7 @@ class RMSNorm(nnx.Module):
     def __init__(self, size: int, *, eps: float = 1e-6, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.eps = eps
         self.weight = Param(
-            size, dtype=dtype, kernel_init=nnx.with_partitioning(nnx.initializers.normal(), (None,)), rngs=rngs
+            size, dtype=dtype, kernel_init=nnx.with_metadata(nnx.initializers.normal(), sharding_names=(None,)), rngs=rngs
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -60,7 +60,7 @@ class Qwen3Attention(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
             use_bias=False,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, tp_shard)),
+            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, tp_shard)),
             rngs=rngs,
         )
         self.k_proj = LoRALinear(
@@ -70,7 +70,7 @@ class Qwen3Attention(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
             use_bias=False,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, tp_shard)),
+            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, tp_shard)),
             rngs=rngs,
         )
         self.v_proj = LoRALinear(
@@ -80,7 +80,7 @@ class Qwen3Attention(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
             use_bias=False,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, tp_shard)),
+            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, tp_shard)),
             rngs=rngs,
         )
         self.o_proj = LoRALinear(
@@ -90,7 +90,7 @@ class Qwen3Attention(nnx.Module):
             dtype=dtype,
             param_dtype=dtype,
             use_bias=False,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (tp_shard, None)),
+            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(tp_shard, None)),
             rngs=rngs,
         )
 
@@ -262,7 +262,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
+            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tp")),
             lora_rank=lora_rank,
             rngs=rngs,
         )
@@ -272,7 +272,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
+            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tp")),
             lora_rank=lora_rank,
             rngs=rngs,
         )
@@ -282,7 +282,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), ("tp", None)),
+            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=("tp", None)),
             lora_rank=lora_rank,
             rngs=rngs,
         )
@@ -305,17 +305,17 @@ class Qwen3Experts(nnx.Module):
         self.config = config
         # MoE experts use regular Linear layers (no LoRA for now in single-adapter mode)
         self.gate_proj = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp"))(
+            nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, None, "tp"))(
                 rngs.params(), (config.num_experts, config.hidden_size, config.moe_intermediate_size), dtype
             )
         )
         self.up_proj = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None, "tp"))(
+            nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, None, "tp"))(
                 rngs.params(), (config.num_experts, config.hidden_size, config.moe_intermediate_size), dtype
             )
         )
         self.down_proj = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp", None))(
+            nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tp", None))(
                 rngs.params(), (config.num_experts, config.moe_intermediate_size, config.hidden_size), dtype
             )
         )
@@ -355,7 +355,7 @@ class Qwen3MoeSparseMoeBlock(nnx.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, None)),
+            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, None)),
             rngs=rngs,
         )
         self.experts = Qwen3Experts(config, dtype=dtype, rngs=rngs)
@@ -428,7 +428,7 @@ class Qwen3Model(nnx.Module):
                 dtype=dtype,
                 lora_rank=config.lora_rank,
                 param_dtype=dtype,
-                embedding_init=nnx.with_partitioning(nnx.initializers.normal(), ("tp", None)),
+                embedding_init=nnx.with_metadata(nnx.initializers.normal(), sharding_names=("tp", None)),
                 rngs=rngs,
             )
         else:
@@ -437,7 +437,7 @@ class Qwen3Model(nnx.Module):
                 features=config.hidden_size,
                 dtype=dtype,
                 param_dtype=dtype,
-                embedding_init=nnx.with_partitioning(nnx.initializers.normal(), ("tp", None)),
+                embedding_init=nnx.with_metadata(nnx.initializers.normal(), sharding_names=("tp", None)),
                 rngs=rngs,
             )
 
@@ -500,8 +500,8 @@ class Qwen3Model(nnx.Module):
                 stacked_values = jnp.stack(kv_cache.values, axis=0)
                 cache_position = kv_cache.cache_position
 
-                # Scan only Params on axis 0, broadcast everything else
-                layer_state_axes = nnx.StateAxes({nnx.Param: 0, ...: None})
+                # Scan Params and RngState on axis 0, broadcast everything else
+                layer_state_axes = nnx.StateAxes({(nnx.Param, nnx.RngState): 0, ...: None})
 
                 @nnx.scan(
                     in_axes=(layer_state_axes, nnx.Carry, None, None, 0, 0),
@@ -525,8 +525,8 @@ class Qwen3Model(nnx.Module):
                     stacked_keys, stacked_values
                 )
             else:
-                # Scan only Params on axis 0, broadcast everything else
-                layer_state_axes = nnx.StateAxes({nnx.Param: 0, ...: None})
+                # Scan Params and RngState on axis 0, broadcast everything else
+                layer_state_axes = nnx.StateAxes({(nnx.Param, nnx.RngState): 0, ...: None})
 
                 @nnx.scan(
                     in_axes=(layer_state_axes, nnx.Carry, None, None),
@@ -601,7 +601,7 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
                     use_bias=False,
                     dtype=dtype,
                     param_dtype=dtype,
-                    kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
+                    kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tp")),
                     lora_rank=config.lora_rank,
                     rngs=rngs,
                 )
@@ -612,7 +612,7 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
                     use_bias=False,
                     dtype=dtype,
                     param_dtype=dtype,
-                    kernel_init=nnx.with_partitioning(nnx.initializers.lecun_normal(), (None, "tp")),
+                    kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tp")),
                     rngs=rngs,
                 )
 
