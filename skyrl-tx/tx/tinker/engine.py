@@ -285,9 +285,22 @@ class TinkerEngine:
         if self.config.enforce_eager:
             self._forward_backward_and_accumulate = forward_backward_and_accumulate
         else:
-            # For nnx path, use nnx.jit which handles NNX modules properly
+            # Get shardings from lora_params (they have nnx.with_partitioning)
+            lora_shardings = jax.tree.map(
+                lambda x: jax.NamedSharding(self.mesh, x.sharding.spec), self.lora_params
+            )
+            accumulated_grads_shardings = AccumulatedGradients(
+                grad_sum=lora_shardings,
+                count=jax.NamedSharding(self.mesh, jax.P(None)),
+            )
+            replicated = jax.NamedSharding(self.mesh, jax.P(None))
+            scalar = jax.NamedSharding(self.mesh, jax.P())
+
+            # For nnx path, use nnx.jit with explicit shardings
             self._forward_backward_and_accumulate = nnx.jit(
                 forward_backward_and_accumulate,
+                in_shardings=(accumulated_grads_shardings, None, replicated, replicated, replicated, replicated, replicated, replicated, replicated),
+                out_shardings=(accumulated_grads_shardings, replicated, replicated, scalar),
                 donate_argnames=("accumulated_grads",),
             )
 
