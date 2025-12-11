@@ -296,8 +296,8 @@ class TinkerEngine:
             replicated = jax.NamedSharding(self.mesh, jax.P(None))
             scalar = jax.NamedSharding(self.mesh, jax.P())
 
-            # For nnx path, use nnx.jit with explicit shardings
-            self._forward_backward_and_accumulate = nnx.jit(
+            # Use jax.jit with explicit shardings (nnx.jit can't handle nnx.State in shardings)
+            self._forward_backward_and_accumulate = jax.jit(
                 forward_backward_and_accumulate,
                 in_shardings=(accumulated_grads_shardings, None, replicated, replicated, replicated, replicated, replicated, replicated, replicated),
                 out_shardings=(accumulated_grads_shardings, replicated, replicated, scalar),
