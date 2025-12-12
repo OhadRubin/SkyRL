@@ -20,7 +20,7 @@ ADDITIONAL_FLAGS=""
 LOG_FILE="/tmp/tinker-api.log"
 # MIN_SEQ_LEN=4096
 # MIN_SEQ_LEN=8192
-MIN_SEQ_LEN=65536
+MIN_SEQ_LEN=60000
 while [[ $# -gt 0 ]]; do
     case $1 in
         --scan-layers)
