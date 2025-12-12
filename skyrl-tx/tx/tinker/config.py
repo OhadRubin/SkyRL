@@ -91,6 +91,14 @@ class EngineConfig(BaseModel):
         default=512,
         description="Key/value chunk size for blockwise/ring attention",
     )
+    use_fused_moe: bool = Field(
+        default=False,
+        description="Use fused MoE kernels (megablox GMM) instead of ragged_dot for expert computation",
+    )
+    use_maxtext_moe: bool = Field(
+        default=False,
+        description="Use MaxText's RoutedMoE implementation for expert computation",
+    )
 
 
 def convert_env_var(env_name: str, env_value: str, expected_type: type):

@@ -167,6 +167,7 @@ def load_safetensors(
     scan_layers = getattr(config, "scan_layers", False)
     num_layers = getattr(config, "num_hidden_layers", None)
     segment_length = getattr(config, "segment_length", None)
+    use_fused_moe = getattr(config, "use_fused_moe", False)
 
     def maybe_reshape_to_segments(tensor: np.ndarray) -> np.ndarray:
         """Reshape tensor from [num_layers, ...] to [num_segments, segment_length, ...] if segment_length is set."""
@@ -186,7 +187,59 @@ def load_safetensors(
 
         # Load tensor on demand
         if "experts" in path:
-            if scan_layers and is_scanned_layer_param(path):
+            # Check if this is fused_moe format (w1/w2) or standard format (gate_proj/up_proj/down_proj)
+            is_fused_w1 = use_fused_moe and "w1" in path
+            is_fused_w2 = use_fused_moe and "w2" in path
+
+            if is_fused_w1:
+                # w1 combines gate_proj and up_proj: (E, I*2, H)
+                # Checkpoint has gate_proj: (I, H) and up_proj: (I, H) per expert
+                # Need to load both, transpose to (H, I), then transpose to (I, H) for fused format
+                def load_w1_for_layer(layer_idx=None):
+                    gate_path = tuple(s if s != "w1" else "gate_proj" for s in path)
+                    up_path = tuple(s if s != "w1" else "up_proj" for s in path)
+                    gate_tensors = []
+                    up_tensors = []
+                    for i in range(config.num_experts):
+                        gate_key = get_expert_key(gate_path, i, layer_idx)
+                        up_key = get_expert_key(up_path, i, layer_idx)
+                        # Checkpoint: (I, H), transpose to (H, I), then transpose to (I, H) for fused
+                        gate_tensors.append(get_tensor(gate_key))  # (I, H)
+                        up_tensors.append(get_tensor(up_key))  # (I, H)
+                    # Stack: (E, I, H), concatenate gate+up on axis 1: (E, I*2, H)
+                    gate_stacked = np.stack(gate_tensors, axis=0)  # (E, I, H)
+                    up_stacked = np.stack(up_tensors, axis=0)  # (E, I, H)
+                    return np.concatenate([gate_stacked, up_stacked], axis=1)  # (E, I*2, H)
+
+                if scan_layers and is_scanned_layer_param(path):
+                    layer_tensors = [load_w1_for_layer(layer_idx) for layer_idx in range(num_layers)]
+                    tensor = np.stack(layer_tensors, axis=0)
+                    tensor = maybe_reshape_to_segments(tensor)
+                    del layer_tensors
+                else:
+                    tensor = load_w1_for_layer()
+
+            elif is_fused_w2:
+                # w2 is transposed down_proj: (E, H, I)
+                # Checkpoint has down_proj: (H, I) per expert
+                def load_w2_for_layer(layer_idx=None):
+                    down_path = tuple(s if s != "w2" else "down_proj" for s in path)
+                    down_tensors = []
+                    for i in range(config.num_experts):
+                        down_key = get_expert_key(down_path, i, layer_idx)
+                        # Checkpoint: (H, I), we need (E, H, I)
+                        down_tensors.append(get_tensor(down_key))  # (H, I)
+                    return np.stack(down_tensors, axis=0)  # (E, H, I)
+
+                if scan_layers and is_scanned_layer_param(path):
+                    layer_tensors = [load_w2_for_layer(layer_idx) for layer_idx in range(num_layers)]
+                    tensor = np.stack(layer_tensors, axis=0)
+                    tensor = maybe_reshape_to_segments(tensor)
+                    del layer_tensors
+                else:
+                    tensor = load_w2_for_layer()
+
+            elif scan_layers and is_scanned_layer_param(path):
                 # For scanned layers with experts: load per-layer, per-expert tensors
                 # Shape will be [num_layers, num_experts, ...]
                 layer_tensors = []

@@ -18,7 +18,10 @@ ADDITIONAL_FLAGS=""
 LOG_FILE=""
 # MIN_SEQ_LEN=4096
 # MIN_SEQ_LEN=8192
+# MIN_SEQ_LEN=16384
+# MIN_SEQ_LEN=32768
 MIN_SEQ_LEN=59392
+
 # 512*119=60928
 # 2048*29=59392
 while [[ $# -gt 0 ]]; do
@@ -37,6 +40,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-load-safetensors)
             ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --no-load-safetensors"
+            shift
+            ;;
+        --use-fused-moe)
+            ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --use-fused-moe"
+            shift
+            ;;
+        --use-maxtext-moe)
+            ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --use-maxtext-moe"
             shift
             ;;
         *)
@@ -74,7 +85,7 @@ EXTERNAL_LORA_BASE="gs://ohadrubin-docker-images/lora-experiments/qwen3-4b/${DAT
 export USE_NNX_VALUE_AND_GRAD=1
 # Model configurationor
 BASE_MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507"
-TENSOR_PARALLEL_SIZE=4
+TENSOR_PARALLEL_SIZE=8
 MAX_LORA_ADAPTERS=4
 MAX_LORA_RANK=8
 TRAIN_MICRO_BATCH_SIZE=1
@@ -85,7 +96,8 @@ TRAIN_MICRO_BATCH_SIZE=1
 EXTERNAL_INFERENCE_URL="https://v6e-8-node-17.ohadrubin.com"
 
 # Precompile common sequence lengths to avoid JIT during training
-PRECOMPILE_SEQ_LENS="${MIN_SEQ_LEN}"
+# PRECOMPILE_SEQ_LENS="${MIN_SEQ_LEN}"
+PRECOMPILE_SEQ_LENS=""
 
 
 
@@ -98,11 +110,13 @@ ts "Reinstalling ringattention"
 uv pip install --reinstall ringattention --quiet
 rm -f uv.lock  # Remove lockfile to ensure local flax is used
 uv sync --extra tpu --extra tinker
+uv pip install -e ~/maxtext --reinstall  # Install maxtext as editable so rsync changes take effect
 uv pip install -e ~/flax --reinstall  # Install flax as editable so rsync changes take effect
 RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/ringattention/__init__.py"
 sed -i 's/jax.lib.xla_bridge.get_backend/jax.extend.backend.get_backend/' "$RING_INIT"
 sed -i 's/^import jax$/import jax\nimport jax.extend/' "$RING_INIT"
 
+ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --shard-attention-heads"
 # Run the server
 # --gradient-checkpointing \
 uv run --no-sync --extra tinker --extra tpu  -m tx.tinker.api \

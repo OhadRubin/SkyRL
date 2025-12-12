@@ -141,12 +141,14 @@ class TinkerEngine:
             use_ring_attention=self.config.use_ring_attention,
             scan_query_chunk_size=self.config.scan_query_chunk_size,
             scan_key_chunk_size=self.config.scan_key_chunk_size,
+            use_fused_moe=self.config.use_fused_moe,
+            use_maxtext_moe=self.config.use_maxtext_moe,
         )
 
         model_class = get_model_class(self.model_config)
 
         # Create model and load weights
-        self.mesh = jax.make_mesh((1, 1, self.config.tensor_parallel_size), ("layer", "dp", "tp"))
+        self.mesh = jax.make_mesh((1, 1, self.config.tensor_parallel_size), ("layer", "dp", "tensor"))
         with jax.set_mesh(self.mesh):
             self.model = model_class(self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0), mesh=self.mesh)
             if self.config.load_safetensors:
@@ -510,8 +512,9 @@ class TinkerEngine:
         # Assign adapter index for this model_id
         adapter_index = max((m.adapter_index for m in self.models.values()), default=0) + 1
 
-        if adapter_index >= self.config.max_lora_adapters:
-            raise ValueError(f"Maximum number of LoRA adapters ({self.config.max_lora_adapters}) reached")
+        # if adapter_index >= self.config.max_lora_adapters:
+            # raise ValueError(f"Maximum number of LoRA adapters ({self.config.max_lora_adapters}) reached")
+        # adapter_index = 0
 
         # Extract LoRA configuration
         lora_config = request_data.lora_config

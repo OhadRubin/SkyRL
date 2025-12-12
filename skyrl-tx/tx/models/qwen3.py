@@ -1,5 +1,7 @@
 import math
+from dataclasses import dataclass, field
 from functools import partial
+from typing import Any, List
 
 from flax import nnx
 from flax.nnx.nn.lora import LoRALinear, LoRAParam
@@ -11,9 +13,137 @@ from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 from tx.layers.lora import LoRAEmbed
 from tx.layers.util import Param, prepare_routing
 from tx.models.configs import Qwen3Config
+from tx.models.experts import fused_moe_func
 from tx.models.types import CausalLMOutput, ModelOutput
 from tx.utils.generator import GeneratorMixin, KVCache, compute_positions
 import flax.linen as nn
+
+# Import maxtext's RoutedMoE
+from MaxText.layers.moe import RoutedMoE
+from MaxText.common_types import DecoderBlockType, ShardMode
+
+
+def _skyrl_logical_axis_rules():
+    """Logical axis rules mapping MaxText names to SkyRL mesh axes (layer, dp, tensor)."""
+    return (
+        # Batch/data axes -> dp
+        ('activation_batch', ('dp',)),
+        ('activation_batch_no_exp', ('dp',)),
+        ('activation_embed_and_logits_batch', ('dp',)),
+        ('activation_embed_and_logits_batch_sequence', ('dp',)),
+        ('activation_prefill_kv_batch', ('dp',)),
+        ('activation_kv_batch', ('dp',)),
+        ('activation_kv_batch_no_exp', ('dp',)),
+        ('decode_batch', ('dp',)),
+        # Head axes -> tensor
+        ('activation_heads', ('tensor',)),
+        ('activation_kv_heads', ('tensor',)),
+        # Length/sequence axes -> None (not sharded)
+        ('activation_length', ()),
+        ('activation_length_no_exp', ()),
+        ('activation_norm_length', ()),
+        ('activation_q_length', ()),
+        ('activation_q_length_no_exp', ()),
+        ('prefill_activation_length', ()),
+        ('prefill_activation_norm_length', ()),
+        ('activation_kv_length', ()),
+        ('decode_length', ()),
+        # Embedding/MLP axes -> tensor for tensor parallelism
+        ('activation_embed', ('tensor',)),
+        ('activation_mlp', ('tensor',)),
+        ('activation_kv', ('tensor',)),
+        ('activation_kv_head_dim', ('tensor',)),
+        ('activation_vocab', ('tensor',)),
+        ('activation_exp', ()),  # No expert parallelism
+        ('activation_stage', ()),
+        # Weight axes
+        ('mlp', ('tensor',)),
+        ('mlp_no_fsdp', ('tensor',)),
+        ('vocab', ('tensor',)),
+        ('heads', ('tensor',)),
+        ('q_heads', ('tensor',)),
+        ('kv_heads', ('tensor',)),
+        ('embed', ()),  # Usually not sharded for weights
+        ('embed_no_exp', ()),
+        ('embed_tensor_transpose', ()),
+        ('exp', ()),  # Expert axis - no expert parallelism
+        ('q_lora', ()),
+        ('kv_lora', ()),
+        # Cache axes
+        ('cache_batch', ('dp',)),
+        ('cache_batch_prefill', ('dp',)),
+        ('cache_sequence', ()),
+        ('cache_heads', ('tensor',)),
+        ('cache_heads_none', ()),
+        ('cache_kv', ('tensor',)),
+        ('cache_scale_batch', ('dp',)),
+        ('cache_scale_sequence', ()),
+        ('cache_scale_heads', ('tensor',)),
+        ('cache_scale_kv', ('tensor',)),
+    )
+
+
+@dataclass
+class MaxTextConfigAdapter:
+    """Minimal config wrapper to use MaxText's RoutedMoE with Qwen3Config."""
+
+    # Core dimensions
+    emb_dim: int
+    num_experts: int
+    num_experts_per_tok: int
+    moe_mlp_dim: int  # intermediate_dim
+
+    # Model identification
+    model_name: str = "qwen3_moe"
+    decoder_block: DecoderBlockType = DecoderBlockType.QWEN3_MOE
+
+    # Routing config (Qwen3 defaults)
+    routed_bias: bool = False
+    routed_score_func: str = "softmax"
+    routed_scaling_factor: float = 1.0
+    norm_topk_prob: bool = True  # Qwen3-specific
+    n_routing_groups: int = -1  # No routing groups
+    topk_routing_group: int = 1
+    use_random_routing: bool = False
+
+    # Computation config
+    dtype: Any = jnp.bfloat16
+    matmul_precision: str = "default"
+    mlp_activations: List[str] = field(default_factory=lambda: ["silu"])
+    mlp_bias: bool = False
+    float32_weight_sum: bool = False
+
+    # Sharding config
+    shard_mode: ShardMode = ShardMode.AUTO
+    fsdp_shard_on_exp: bool = False
+    attention: str = "dot_product"  # Not vllm_rpa
+    logical_axis_rules: Any = field(default_factory=_skyrl_logical_axis_rules)
+
+    # Backend config
+    sparse_matmul: bool = True  # Use GMM-based sparse matmul
+    megablox: bool = True
+    use_tokamax_gmm: bool = False
+    quantization: Any = None
+    use_qwix_quantization: bool = False
+
+    # Tiling config
+    wi_tile_fwd_batch_seq: int = 512
+
+    # Advanced options
+    use_ring_of_experts: bool = False
+    use_custom_sort_vjp: bool = True
+    mlp_activations_limit: float = 10.0
+
+    @classmethod
+    def from_qwen3_config(cls, config: Qwen3Config, dtype=jnp.bfloat16) -> "MaxTextConfigAdapter":
+        """Create MaxText config from Qwen3Config."""
+        return cls(
+            emb_dim=config.hidden_size,
+            num_experts=config.num_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            moe_mlp_dim=config.moe_intermediate_size,
+            dtype=dtype,
+        )
 
 class RMSNorm(nnx.Module):
     def __init__(self, size: int, *, eps: float = 1e-6, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
@@ -43,12 +173,13 @@ class Qwen3Attention(nnx.Module):
         self.mesh = mesh
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        tp = get_abstract_mesh().shape.get("tp", 1)
+        tp = get_abstract_mesh().shape.get("tensor", 1)
         shard_attention_heads = config.shard_attention_heads
+        shard_attention_heads = False
         if shard_attention_heads:
             assert self.num_heads % tp == 0, f"num_heads={self.num_heads} must be divisible by tp={tp}"
-            assert self.num_kv_heads % tp == 0, f"num_kv_heads={self.num_kv_heads} must be divisible by tp={tp}"
-        tp_shard = "tp" if shard_attention_heads else None
+            # assert self.num_kv_heads % tp == 0, f"num_kv_heads={self.num_kv_heads} must be divisible by tp={tp}"
+        tp_shard = "tensor" if shard_attention_heads else None
         self.tp_shard = tp_shard
         self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.num_heads
 
@@ -167,12 +298,12 @@ class Qwen3Attention(nnx.Module):
                 jnp.full_like(attention_mask_expanded, jnp.finfo(x.dtype).min, dtype=x.dtype),
             )
 
-            # Wrap ringattention in nnx.shard_map - use "tp" axis for sequence parallelism
+            # Wrap ringattention in nnx.shard_map - use "tensor" axis for sequence parallelism
             # Ring attention distributes sequence across devices in a ring topology
             ring_attention_sharded = nnx.shard_map(
                 partial(
                     ringattention,
-                    axis_name="tp",  # Use tp axis for ring communication
+                    axis_name="tensor",  # Use tp axis for ring communication
                     float32_logits=True,
                     cache_idx=None,
                     blockwise_kwargs=dict(
@@ -190,13 +321,13 @@ class Qwen3Attention(nnx.Module):
                 ),
                 mesh=self.mesh,
                 in_specs=(
-                    P("dp", "tp", None, None),  # q: [B, T, num_heads, head_dim]
-                    P("dp", "tp", None, None),  # k: [B, T, num_heads, head_dim]
-                    P("dp", "tp", None, None),  # v: [B, T, num_heads, head_dim]
+                    P("dp", "tensor", None, None),  # q: [B, T, num_heads, head_dim]
+                    P("dp", "tensor", None, None),  # k: [B, T, num_heads, head_dim]
+                    P("dp", "tensor", None, None),  # v: [B, T, num_heads, head_dim]
                     P("dp", None, None, None),  # bias: [B, 1, 1, T]
                     P("dp", None),              # segment_ids (None)
                 ),
-                out_specs=P("dp", "tp", None, None),
+                out_specs=P("dp", "tensor", None, None),
             )
             attn_output = ring_attention_sharded(q, k, v, attention_bias, None)
             # attn_output: [B, T, num_heads, head_dim]
@@ -212,11 +343,13 @@ class Qwen3Attention(nnx.Module):
                 n_rep = self.num_heads // self.num_kv_heads
                 k = jnp.repeat(k, n_rep, axis=1)  # [B, num_heads, T, head_dim]
                 v = jnp.repeat(v, n_rep, axis=1)  # [B, num_heads, T, head_dim]
+            k = jax.lax.with_sharding_constraint(k, P(("dp","layer"),"tensor", None, None) )
+            v = jax.lax.with_sharding_constraint(v, P(("dp","layer"),"tensor", None, None))
 
             # Use Pallas flash attention wrapped in shard_map
             # Mosaic kernels cannot be automatically partitioned, so we must use shard_map
             # Layout: [batch, num_heads, seq_len, head_dim]
-            # Sharding: batch on "dp", heads on "tp" (if shard_attention_heads), seq/head_dim unsharded
+            # Sharding: batch on "dp", heads on "tensor" (if shard_attention_heads), seq/head_dim unsharded
             sm_scale = 1.0 / math.sqrt(self.head_dim)
             causal = kv_cache is None
 
@@ -262,7 +395,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tp")),
+            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tensor")),
             lora_rank=lora_rank,
             rngs=rngs,
         )
@@ -272,7 +405,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tp")),
+            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tensor")),
             lora_rank=lora_rank,
             rngs=rngs,
         )
@@ -282,7 +415,7 @@ class Qwen3MLP(nnx.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=("tp", None)),
+            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=("tensor", None)),
             lora_rank=lora_rank,
             rngs=rngs,
         )
@@ -303,62 +436,127 @@ class Qwen3Experts(nnx.Module):
 
     def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
         self.config = config
-        # MoE experts use regular Linear layers (no LoRA for now in single-adapter mode)
-        self.gate_proj = nnx.Param(
-            nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, None, "tp"))(
-                rngs.params(), (config.num_experts, config.hidden_size, config.moe_intermediate_size), dtype
+        use_fused_moe = getattr(config, 'use_fused_moe', False)
+
+        if use_fused_moe:
+            # Fused MoE format: w1 combines gate+up, w2 is transposed down
+            # w1: (E, I*2, H) - gate and up merged
+            # w2: (E, H, I) - down transposed
+            self.w1 = nnx.Param(
+                nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tensor", None))(
+                    rngs.params(), (config.num_experts, config.moe_intermediate_size * 2, config.hidden_size), dtype
+                )
             )
-        )
-        self.up_proj = nnx.Param(
-            nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, None, "tp"))(
-                rngs.params(), (config.num_experts, config.hidden_size, config.moe_intermediate_size), dtype
+            self.w2 = nnx.Param(
+                nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, None, "tensor"))(
+                    rngs.params(), (config.num_experts, config.hidden_size, config.moe_intermediate_size), dtype
+                )
             )
-        )
-        self.down_proj = nnx.Param(
-            nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tp", None))(
-                rngs.params(), (config.num_experts, config.moe_intermediate_size, config.hidden_size), dtype
+        else:
+            # Standard format for ragged_dot
+            # gate_proj/up_proj: (E, H, I)
+            # down_proj: (E, I, H)
+            self.gate_proj = nnx.Param(
+                nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, None, "tensor"))(
+                    rngs.params(), (config.num_experts, config.hidden_size, config.moe_intermediate_size), dtype
+                )
             )
-        )
+            self.up_proj = nnx.Param(
+                nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, None, "tensor"))(
+                    rngs.params(), (config.num_experts, config.hidden_size, config.moe_intermediate_size), dtype
+                )
+            )
+            self.down_proj = nnx.Param(
+                nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tensor", None))(
+                    rngs.params(), (config.num_experts, config.moe_intermediate_size, config.hidden_size), dtype
+                )
+            )
 
-    def __call__(self, hidden_states: jax.Array, router_logits: jax.Array) -> jax.Array:
-        # Get top-k experts for each token and compute routing weights
-        routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
-        routing_weights = nnx.softmax(routing_weights, axis=-1)
+    def __call__(self, hidden_states: jax.Array, router_logits: jax.Array, mesh=None) -> jax.Array:
+        if getattr(self.config, 'use_fused_moe', False):
+            # Capture w1/w2 in closure (saved), only checkpoint hidden_states/router_logits
+            w1, w2 = self.w1.value, self.w2.value
+            @partial(jax.checkpoint, policy=jax.checkpoint_policies.nothing_saveable)
+            def _fused_moe_forward(hidden_states, router_logits):
+                return fused_moe_func(
+                    hidden_states=hidden_states,
+                    w1=w1,
+                    w2=w2,
+                    w1_bias=None,
+                    w2_bias=None,
+                    gating_output=router_logits,
+                    topk=self.config.num_experts_per_tok,
+                    renormalize=True,
+                    mesh=mesh,
+                    use_ep=False,
+                    activation="silu",
+                )
+            return _fused_moe_forward(hidden_states, router_logits)
 
-        # Prepare for ragged_dot by sorting tokens based on their assigned expert
-        selected_experts_flat = selected_experts.ravel()
-        hidden_states_expanded = jnp.repeat(hidden_states, self.config.num_experts_per_tok, axis=0)
-        hidden_states_sorted, group_sizes, unsort_indices, _ = prepare_routing(
-            hidden_states_expanded,
-            selected_experts_flat,
-            self.config.num_experts,
-        )
+        # Remat the MoE expert computation to save memory during backward pass (ragged_dot path only)
+        @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
+        def _experts_forward(self, hidden_states, router_logits):
+            # Get top-k experts for each token and compute routing weights
+            routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
+            routing_weights = nnx.softmax(routing_weights, axis=-1)
 
-        # Apply expert layers using ragged_dot
-        gate_out = jax.lax.ragged_dot(hidden_states_sorted, self.gate_proj.value, group_sizes)
-        up_out = jax.lax.ragged_dot(hidden_states_sorted, self.up_proj.value, group_sizes)
-        down_out = jax.lax.ragged_dot(nnx.silu(gate_out) * up_out, self.down_proj.value, group_sizes)
+            # Prepare for ragged_dot by sorting tokens based on their assigned expert
+            selected_experts_flat = selected_experts.ravel()
+            hidden_states_expanded = jnp.repeat(hidden_states, self.config.num_experts_per_tok, axis=0)
+            hidden_states_sorted, group_sizes, unsort_indices, _ = prepare_routing(
+                hidden_states_expanded,
+                selected_experts_flat,
+                self.config.num_experts,
+            )
 
-        # Unsort and combine the expert outputs
-        unsorted_out = down_out[unsort_indices]
-        reshaped_out = unsorted_out.reshape(-1, self.config.num_experts_per_tok, self.config.hidden_size)
-        return jnp.sum(reshaped_out * routing_weights[..., None], axis=1)
+            # Apply expert layers using ragged_dot
+            gate_out = jax.lax.ragged_dot(hidden_states_sorted, self.gate_proj.value, group_sizes)
+            up_out = jax.lax.ragged_dot(hidden_states_sorted, self.up_proj.value, group_sizes)
+            down_out = jax.lax.ragged_dot(nnx.silu(gate_out) * up_out, self.down_proj.value, group_sizes)
+
+            # Unsort and combine the expert outputs
+            unsorted_out = down_out[unsort_indices]
+            reshaped_out = unsorted_out.reshape(-1, self.config.num_experts_per_tok, self.config.hidden_size)
+            return jnp.sum(reshaped_out * routing_weights[..., None], axis=1)
+        return _experts_forward(self, hidden_states, router_logits)
 
 
 class Qwen3MoeSparseMoeBlock(nnx.Module):
 
-    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
+    def __init__(self, config: Qwen3Config, *, dtype: jnp.dtype, rngs: nnx.Rngs, mesh=None) -> None:
         self.config = config
-        self.gate = nnx.Linear(
-            config.hidden_size,
-            config.num_experts,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=dtype,
-            kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, None)),
-            rngs=rngs,
-        )
-        self.experts = Qwen3Experts(config, dtype=dtype, rngs=rngs)
+        self.mesh = mesh
+        self.use_maxtext_moe = getattr(config, 'use_maxtext_moe', False)
+
+        if self.use_maxtext_moe:
+            # Use MaxText's RoutedMoE
+            from MaxText.layers.initializers import nd_dense_init
+            maxtext_config = MaxTextConfigAdapter.from_qwen3_config(config, dtype=dtype)
+            self.moe_block = RoutedMoE(
+                config=maxtext_config,
+                num_experts=config.num_experts,
+                num_experts_per_tok=config.num_experts_per_tok,
+                mesh=mesh,
+                kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
+                kernel_axes=("embed", None),
+                intermediate_dim=config.moe_intermediate_size,
+                dtype=dtype,
+                weight_dtype=dtype,
+                quant=None,
+                rngs=rngs,
+            )
+        else:
+            # Original implementation
+            self.gate = nnx.Linear(
+                config.hidden_size,
+                config.num_experts,
+                use_bias=False,
+                dtype=dtype,
+                param_dtype=dtype,
+                kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, None)),
+                rngs=rngs,
+            )
+            self.experts = Qwen3Experts(config, dtype=dtype, rngs=rngs)
 
     def __call__(
         self,
@@ -366,16 +564,25 @@ class Qwen3MoeSparseMoeBlock(nnx.Module):
         *,
         return_router_logits: bool = False,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
-        (batch_size, seq_len, hidden_size) = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, hidden_size)
-        router_logits = self.gate(hidden_states)
+        if self.use_maxtext_moe:
+            # MaxText's RoutedMoE handles everything
+            output, load_balance_loss = self.moe_block(hidden_states)
+            if return_router_logits:
+                # RoutedMoE doesn't return router_logits directly, return None
+                return output, None
+            return output
+        else:
+            # Original implementation
+            (batch_size, seq_len, hidden_size) = hidden_states.shape
+            hidden_states = hidden_states.reshape(-1, hidden_size)
+            router_logits = self.gate(hidden_states)
 
-        hidden_states = self.experts(hidden_states, router_logits)
-        hidden_states = hidden_states.reshape(batch_size, seq_len, hidden_size)
+            hidden_states = self.experts(hidden_states, router_logits, mesh=self.mesh)
+            hidden_states = hidden_states.reshape(batch_size, seq_len, hidden_size)
 
-        if return_router_logits:
-            return hidden_states, router_logits
-        return hidden_states
+            if return_router_logits:
+                return hidden_states, router_logits
+            return hidden_states
 
 
 class Qwen3DecoderLayer(nnx.Module):
@@ -385,14 +592,13 @@ class Qwen3DecoderLayer(nnx.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, rngs=rngs)
         self.self_attn = Qwen3Attention(config, dtype=dtype, rngs=rngs, mesh=mesh)
         if getattr(config, "num_experts", None):
-            self.mlp = Qwen3MoeSparseMoeBlock(config, dtype=dtype, rngs=rngs)
+            self.mlp = Qwen3MoeSparseMoeBlock(config, dtype=dtype, rngs=rngs, mesh=mesh)
         else:
             self.mlp = Qwen3MLP(config, dtype=dtype, rngs=rngs)
-
+    @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable)
     def __call__(
         self,
         hidden_states: jax.Array,
-        *,
         attention_mask: jax.Array,
         positions: jax.Array,
         kv_cache: tuple[jax.Array, jax.Array, int] | None = None,
@@ -428,7 +634,7 @@ class Qwen3Model(nnx.Module):
                 dtype=dtype,
                 lora_rank=config.lora_rank,
                 param_dtype=dtype,
-                embedding_init=nnx.with_metadata(nnx.initializers.normal(), sharding_names=("tp", None)),
+                embedding_init=nnx.with_metadata(nnx.initializers.normal(), sharding_names=("tensor", None)),
                 rngs=rngs,
             )
         else:
@@ -437,7 +643,7 @@ class Qwen3Model(nnx.Module):
                 features=config.hidden_size,
                 dtype=dtype,
                 param_dtype=dtype,
-                embedding_init=nnx.with_metadata(nnx.initializers.normal(), sharding_names=("tp", None)),
+                embedding_init=nnx.with_metadata(nnx.initializers.normal(), sharding_names=("tensor", None)),
                 rngs=rngs,
             )
 
@@ -501,8 +707,10 @@ class Qwen3Model(nnx.Module):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-
-        hidden_states = self.embed_tokens(input_ids)
+        @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable)
+        def embed_tokens_forward(input_ids):
+            return self.embed_tokens(input_ids)
+        hidden_states = embed_tokens_forward(input_ids)
         all_hidden_states: list[jax.Array] = []
         
         # hidden_states = nn.with_logical_constraint(hidden_states, (("dp","layer"), None, None))
@@ -567,7 +775,7 @@ class Qwen3Model(nnx.Module):
                     scan_fn,
                     length=num_layers,
                     in_axes=(nnx.Carry, 0),
-                    segment_length=1,  # 6 segments of 8 layers each
+                    # segment_length=1,  # 6 segments of 8 layers each
                     segment_broadcast_params=False,  # False=reshape approach, True=dynamic_slice
                 )(initial_carry, self.layers)
 
@@ -622,7 +830,7 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
                     use_bias=False,
                     dtype=dtype,
                     param_dtype=dtype,
-                    kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tp")),
+                    kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tensor")),
                     lora_rank=config.lora_rank,
                     rngs=rngs,
                 )
@@ -633,7 +841,7 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
                     use_bias=False,
                     dtype=dtype,
                     param_dtype=dtype,
-                    kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tp")),
+                    kernel_init=nnx.with_metadata(nnx.initializers.lecun_normal(), sharding_names=(None, "tensor")),
                     rngs=rngs,
                 )
 

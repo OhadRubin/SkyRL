@@ -22,6 +22,8 @@ class Qwen3Config(PretrainedConfig):
         use_ring_attention: Whether to use ring attention for distributed sequence parallelism
         scan_query_chunk_size: Chunk size for query in blockwise/ring attention
         scan_key_chunk_size: Chunk size for key/value in blockwise/ring attention
+        use_fused_moe: Whether to use fused MoE kernels (megablox GMM) instead of ragged_dot
+        use_maxtext_moe: Whether to use MaxText's RoutedMoE implementation
     """
 
     # Type hints for LoRA attributes
@@ -37,6 +39,9 @@ class Qwen3Config(PretrainedConfig):
     use_ring_attention: bool
     scan_query_chunk_size: int
     scan_key_chunk_size: int
+    # MoE attributes
+    use_fused_moe: bool
+    use_maxtext_moe: bool
 
     def __init__(
         self,
@@ -53,6 +58,8 @@ class Qwen3Config(PretrainedConfig):
         use_ring_attention: bool = False,
         scan_query_chunk_size: int = 512,
         scan_key_chunk_size: int = 512,
+        use_fused_moe: bool = False,
+        use_maxtext_moe: bool = False,
     ):
         # Copy all attributes from the base config
         super().__init__(**config.to_dict())
@@ -70,3 +77,6 @@ class Qwen3Config(PretrainedConfig):
         self.use_ring_attention = use_ring_attention
         self.scan_query_chunk_size = scan_query_chunk_size
         self.scan_key_chunk_size = scan_key_chunk_size
+        # MoE parameters
+        self.use_fused_moe = use_fused_moe
+        self.use_maxtext_moe = use_maxtext_moe
