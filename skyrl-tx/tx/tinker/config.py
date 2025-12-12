@@ -79,6 +79,10 @@ class EngineConfig(BaseModel):
         default=False,
         description="Use ring attention for distributed sequence parallelism (requires sequence_parallel_size > 1)",
     )
+    no_load_safetensors: bool = Field(
+        default=False,
+        description="Don't load safetensors weights, only load checkpoint state",
+    )
     scan_query_chunk_size: int = Field(
         default=512,
         description="Query chunk size for blockwise/ring attention",

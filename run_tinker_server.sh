@@ -37,6 +37,10 @@ while [[ $# -gt 0 ]]; do
             MIN_SEQ_LEN="$2"
             shift 2
             ;;
+        --no-load-safetensors)
+            ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --no-load-safetensors"
+            shift
+            ;;
         *)
             shift
             ;;
