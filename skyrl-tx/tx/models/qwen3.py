@@ -85,13 +85,26 @@ def _skyrl_logical_axis_rules():
 
 @dataclass
 class MaxTextConfigAdapter:
-    """Minimal config wrapper to use MaxText's RoutedMoE with Qwen3Config."""
+    """Config wrapper to use MaxText's RoutedMoE with Qwen3Config.
 
-    # Core dimensions
+    Maps maxtext YAML config fields to the attributes RoutedMoE expects via self.config.X
+    """
+
+    # Core dimensions (from YAML)
     emb_dim: int
     num_experts: int
     num_experts_per_tok: int
-    moe_mlp_dim: int  # intermediate_dim
+    moe_mlp_dim: int  # base_moe_mlp_dim in YAML
+
+    # Model architecture (from YAML)
+    num_decoder_layers: int = 48  # base_num_decoder_layers
+    num_query_heads: int = 32  # base_num_query_heads
+    num_kv_heads: int = 4  # base_num_kv_heads
+    head_dim: int = 128
+    vocab_size: int = 151936
+    rms_norm_eps: float = 1e-6  # normalization_layer_epsilon
+    use_qk_norm: bool = True
+    rope_theta: int = 10_000_000  # rope_max_timescale
 
     # Model identification
     model_name: str = "qwen3_moe"
@@ -108,10 +121,14 @@ class MaxTextConfigAdapter:
 
     # Computation config
     dtype: Any = jnp.bfloat16
+    weight_dtype: Any = jnp.bfloat16
     matmul_precision: str = "default"
-    mlp_activations: List[str] = field(default_factory=lambda: ["silu"])
+    mlp_activations: List[str] = field(default_factory=lambda: ["silu", "linear"])
     mlp_bias: bool = False
     float32_weight_sum: bool = False
+    activations_in_float32: bool = False
+    enable_dropout: bool = False
+    dropout_rate: float = 0.0
 
     # Sharding config
     shard_mode: ShardMode = ShardMode.AUTO
@@ -126,13 +143,35 @@ class MaxTextConfigAdapter:
     quantization: Any = None
     use_qwix_quantization: bool = False
 
-    # Tiling config
+    # Tiling config (defaults from maxtext)
     wi_tile_fwd_batch_seq: int = 512
+    wi_tile_fwd_embed_dim: int = 0
+    wi_tile_fwd_mlp_dim: int = 0
+    wi_tile_dlhs_batch_seq: int = 0
+    wi_tile_dlhs_embed_dim: int = 0
+    wi_tile_dlhs_mlp_dim: int = 0
+    wi_tile_drhs_batch_seq: int = 0
+    wi_tile_drhs_embed_dim: int = 0
+    wi_tile_drhs_mlp_dim: int = 0
+    wo_tile_fwd_batch_seq: int = 0
+    wo_tile_fwd_embed_dim: int = 0
+    wo_tile_fwd_mlp_dim: int = 0
+    wo_tile_dlhs_batch_seq: int = 0
+    wo_tile_dlhs_embed_dim: int = 0
+    wo_tile_dlhs_mlp_dim: int = 0
+    wo_tile_drhs_batch_seq: int = 0
+    wo_tile_drhs_embed_dim: int = 0
+    wo_tile_drhs_mlp_dim: int = 0
 
     # Advanced options
     use_ring_of_experts: bool = False
     use_custom_sort_vjp: bool = True
     mlp_activations_limit: float = 10.0
+    capacity_factor: float = 0.0  # 0 = no capacity limit
+    load_balance_loss_weight: float = 0.01
+    model_call_mode: str = "train"  # "train" or "inference"
+    moe_fsdp_use_two_stage_all_gather: bool = False
+    shared_experts: int = 0  # For DeepSeek-style shared experts
 
     @classmethod
     def from_qwen3_config(cls, config: Qwen3Config, dtype=jnp.bfloat16) -> "MaxTextConfigAdapter":
@@ -142,8 +181,60 @@ class MaxTextConfigAdapter:
             num_experts=config.num_experts,
             num_experts_per_tok=config.num_experts_per_tok,
             moe_mlp_dim=config.moe_intermediate_size,
+            num_decoder_layers=config.num_hidden_layers,
+            num_query_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads),
+            vocab_size=config.vocab_size,
+            rms_norm_eps=config.rms_norm_eps,
+            rope_theta=config.rope_theta,
             dtype=dtype,
+            weight_dtype=dtype,
         )
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str, dtype=jnp.bfloat16) -> "MaxTextConfigAdapter":
+        """Create MaxText config from a maxtext YAML config file.
+
+        Args:
+            yaml_path: Path to maxtext config file (e.g., ~/maxtext/src/MaxText/configs/models/qwen3-30b-a3b.yml)
+            dtype: JAX dtype for the model
+        """
+        import os
+        import yaml
+
+        yaml_path = os.path.expanduser(yaml_path)
+        with open(yaml_path, 'r') as f:
+            cfg = yaml.safe_load(f)
+
+        # Map maxtext YAML fields to MaxTextConfigAdapter fields
+        return cls(
+            # Core dimensions
+            emb_dim=cfg.get('base_emb_dim', 2048),
+            num_experts=cfg.get('num_experts', 128),
+            num_experts_per_tok=cfg.get('num_experts_per_tok', 8),
+            moe_mlp_dim=cfg.get('base_moe_mlp_dim', 768),
+            # Model architecture
+            num_decoder_layers=cfg.get('base_num_decoder_layers', 48),
+            num_query_heads=cfg.get('base_num_query_heads', 32),
+            num_kv_heads=cfg.get('base_num_kv_heads', 4),
+            head_dim=cfg.get('head_dim', 128),
+            vocab_size=cfg.get('vocab_size', 151936),
+            rms_norm_eps=cfg.get('normalization_layer_epsilon', 1e-6),
+            use_qk_norm=cfg.get('use_qk_norm', True),
+            rope_theta=cfg.get('rope_max_timescale', 10_000_000),
+            # Computation
+            mlp_activations=cfg.get('mlp_activations', ['silu', 'linear']),
+            norm_topk_prob=cfg.get('norm_topk_prob', True),
+            enable_dropout=cfg.get('enable_dropout', False),
+            dtype=dtype,
+            weight_dtype=dtype,
+        )
+
+    @classmethod
+    def qwen3_30b_a3b(cls, dtype=jnp.bfloat16) -> "MaxTextConfigAdapter":
+        """Create MaxText config for Qwen3-30B-A3B from ~/maxtext config."""
+        return cls.from_yaml('~/maxtext/src/MaxText/configs/models/qwen3-30b-a3b.yml', dtype=dtype)
 
 class RMSNorm(nnx.Module):
     def __init__(self, size: int, *, eps: float = 1e-6, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:

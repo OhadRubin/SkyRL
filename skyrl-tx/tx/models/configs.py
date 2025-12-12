@@ -24,6 +24,9 @@ class Qwen3Config(PretrainedConfig):
         scan_key_chunk_size: Chunk size for key/value in blockwise/ring attention
         use_fused_moe: Whether to use fused MoE kernels (megablox GMM) instead of ragged_dot
         use_maxtext_moe: Whether to use MaxText's RoutedMoE implementation
+
+    Class Methods:
+        qwen3_30b_a3b: Create config for Qwen3-30B-A3B (128 experts, top-8)
     """
 
     # Type hints for LoRA attributes
