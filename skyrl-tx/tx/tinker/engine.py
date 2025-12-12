@@ -149,8 +149,8 @@ class TinkerEngine:
         self.mesh = jax.make_mesh((1, 1, self.config.tensor_parallel_size), ("layer", "dp", "tp"))
         with jax.set_mesh(self.mesh):
             self.model = model_class(self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0), mesh=self.mesh)
-            # if not self.config.no_load_safetensors:
-            # load_safetensors(checkpoint_path, self.model_config, self.model, reshape_for_scan=self.model_config.reshape_for_scan)
+            if self.config.load_safetensors:
+                load_safetensors(checkpoint_path, self.model_config, self.model, reshape_for_scan=self.model_config.reshape_for_scan)
 
             # Split model into LoRA and non-LoRA parameters
             self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, self.model.is_lora_param, ...)

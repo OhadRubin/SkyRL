@@ -5,16 +5,6 @@ set -e
 
 ts() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
-# Cleanup handler to print scp command on Ctrl+C
-cleanup() {
-    ts "Interrupted!"
-    echo "To copy logs:"
-    echo "mkdir -p ./logs/${JAX_DUMP_DATE}/${JAX_DUMP_TIME} && gcloud alpha compute tpus tpu-vm scp --recurse ohadr@v6e-8-node-15:${JAX_DUMP_IR_TO} ./logs/${JAX_DUMP_DATE}/${JAX_DUMP_TIME}/jax_ir_dump --zone us-east1-d"
-    echo "gcloud alpha compute tpus tpu-vm scp ohadr@v6e-8-node-15:${LOG_FILE} ./logs/${JAX_DUMP_DATE}/${JAX_DUMP_TIME}/tinker-api.log --zone us-east1-d"
-    exit 130
-}
-trap cleanup SIGINT SIGTERM
-
 ts "Starting Tinker server script"
 cd ~/SkyRL/skyrl-tx
 ts "Running git pull"
@@ -39,8 +29,8 @@ while [[ $# -gt 0 ]]; do
             ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --scan-layers --segment-length 8"
             shift
             ;;
-        --log-file)
-            LOG_FILE="$2"
+        --dump-ts)
+            JAX_DUMP_TS="$2"
             shift 2
             ;;
         --min-seq-len)
@@ -60,17 +50,21 @@ done
 export JAX_LOG_COMPILES=1
 export JAX_TRACEBACK_FILTERING=off
 export JAX_DUMP_IR_MODES='jaxpr'
-JAX_DUMP_DATE=$(date '+%Y-%m-%d')
-JAX_DUMP_TIME=$(date '+%H-%M')
-JAX_DUMP_TS="${JAX_DUMP_DATE}_${JAX_DUMP_TIME}"
-export JAX_DUMP_IR_TO="/tmp/jax_ir_dump_${JAX_DUMP_TS}"
-ts "JAX IR dump dir: ${JAX_DUMP_IR_TO}"
 
-# Set default LOG_FILE if not provided via --log-file
-if [ -z "$LOG_FILE" ]; then
-    LOG_FILE="/tmp/logs/${JAX_DUMP_DATE}/${JAX_DUMP_TIME}/tinker-api.log"
-    mkdir -p "$(dirname "$LOG_FILE")"
+# Use passed JAX_DUMP_TS or calculate it
+if [ -z "$JAX_DUMP_TS" ]; then
+    JAX_DUMP_DATE=$(date '+%Y-%m-%d')
+    JAX_DUMP_TIME=$(date '+%H-%M')
+    JAX_DUMP_TS="${JAX_DUMP_DATE}_${JAX_DUMP_TIME}"
+else
+    # Parse date and time from JAX_DUMP_TS (format: YYYY-MM-DD_HH-MM)
+    JAX_DUMP_DATE="${JAX_DUMP_TS%_*}"
+    JAX_DUMP_TIME="${JAX_DUMP_TS#*_}"
 fi
+export JAX_DUMP_IR_TO="/tmp/jax_ir_dump_${JAX_DUMP_TS}"
+LOG_FILE="/tmp/logs/${JAX_DUMP_TS}/tinker-api.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+ts "JAX IR dump dir: ${JAX_DUMP_IR_TO}"
 ts "Log file: ${LOG_FILE}"
 # export XLA_FLAGS='--xla_disable_hlo_passes=algsimp'
 
