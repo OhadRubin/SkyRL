@@ -18,10 +18,6 @@ Stop the vllm-tpu container if running:
 sudo docker stop vllm-tpu
 ```
 
-Or kill any process on port 8000:
-```bash
-sudo lsof -i :8000 | awk 'NR>1 {print $2}' | xargs -r sudo kill -9
-```
 
 ## 3. Clone the repository
 
