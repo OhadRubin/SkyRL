@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "datasets>=4.0.0",
-    "flax @ git+https://github.com/OhadRubin/flax.git@remat-scan-nnx",
+    "flax @ file:///home/ohadr/flax",
     "optax>=0.2.5",
     "pillow>=11.3.0",
     "rich>=14.1.0",
