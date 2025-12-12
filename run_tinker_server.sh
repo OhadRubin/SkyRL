@@ -9,7 +9,7 @@ ts() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 cleanup() {
     ts "Interrupted!"
     echo "To copy logs:"
-    echo "gcloud alpha compute tpus tpu-vm scp --recurse ohadr@v6e-8-node-15:${JAX_DUMP_IR_TO} ./logs/${JAX_DUMP_DATE}/${JAX_DUMP_TIME}/jax_ir_dump --zone us-east1-d"
+    echo "mkdir -p ./logs/${JAX_DUMP_DATE}/${JAX_DUMP_TIME} && gcloud alpha compute tpus tpu-vm scp --recurse ohadr@v6e-8-node-15:${JAX_DUMP_IR_TO} ./logs/${JAX_DUMP_DATE}/${JAX_DUMP_TIME}/jax_ir_dump --zone us-east1-d"
     echo "gcloud alpha compute tpus tpu-vm scp ohadr@v6e-8-node-15:${LOG_FILE} ./logs/${JAX_DUMP_DATE}/${JAX_DUMP_TIME}/tinker-api.log --zone us-east1-d"
     exit 130
 }
