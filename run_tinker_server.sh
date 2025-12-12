@@ -5,6 +5,16 @@ set -e
 
 ts() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+# Cleanup handler to print scp command on Ctrl+C
+cleanup() {
+    ts "Interrupted!"
+    echo "To copy logs:"
+    echo "gcloud alpha compute tpus tpu-vm scp --recurse ohadr@v6e-8-node-15:${JAX_DUMP_IR_TO} ./logs/${JAX_DUMP_DATE}/${JAX_DUMP_TIME}/jax_ir_dump --zone us-east1-d"
+    echo "gcloud alpha compute tpus tpu-vm scp ohadr@v6e-8-node-15:${LOG_FILE} ./logs/${JAX_DUMP_DATE}/${JAX_DUMP_TIME}/tinker-api.log --zone us-east1-d"
+    exit 130
+}
+trap cleanup SIGINT SIGTERM
+
 ts "Starting Tinker server script"
 cd ~/SkyRL/skyrl-tx
 ts "Running git pull"
@@ -17,7 +27,7 @@ export HF_HUB_CACHE=/dev/shm/huggingface_cache/hub
 export TRANSFORMERS_CACHE=/dev/shm/huggingface_cache
 
 ADDITIONAL_FLAGS=""
-LOG_FILE="/tmp/tinker-api.log"
+LOG_FILE=""
 # MIN_SEQ_LEN=4096
 # MIN_SEQ_LEN=8192
 MIN_SEQ_LEN=59392
@@ -50,9 +60,18 @@ done
 export JAX_LOG_COMPILES=1
 export JAX_TRACEBACK_FILTERING=off
 export JAX_DUMP_IR_MODES='jaxpr'
-JAX_DUMP_TS=$(date '+%Y%m%d_%H%M%S')
+JAX_DUMP_DATE=$(date '+%Y-%m-%d')
+JAX_DUMP_TIME=$(date '+%H-%M')
+JAX_DUMP_TS="${JAX_DUMP_DATE}_${JAX_DUMP_TIME}"
 export JAX_DUMP_IR_TO="/tmp/jax_ir_dump_${JAX_DUMP_TS}"
 ts "JAX IR dump dir: ${JAX_DUMP_IR_TO}"
+
+# Set default LOG_FILE if not provided via --log-file
+if [ -z "$LOG_FILE" ]; then
+    LOG_FILE="/tmp/logs/${JAX_DUMP_DATE}/${JAX_DUMP_TIME}/tinker-api.log"
+    mkdir -p "$(dirname "$LOG_FILE")"
+fi
+ts "Log file: ${LOG_FILE}"
 # export XLA_FLAGS='--xla_disable_hlo_passes=algsimp'
 
 sudo chown -R $(whoami) /dev/shm/huggingface_cache
@@ -61,7 +80,7 @@ DATE=$(date +%Y%m%d)
 CHECKPOINTS_BASE="/dev/shm/huggingface_cache/lora-experiments/qwen3-4b/${DATE}"
 EXTERNAL_LORA_BASE="gs://ohadrubin-docker-images/lora-experiments/qwen3-4b/${DATE}"
 export USE_NNX_VALUE_AND_GRAD=1
-# Model configuration
+# Model configurationor
 BASE_MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507"
 TENSOR_PARALLEL_SIZE=4
 MAX_LORA_ADAPTERS=4
