@@ -74,7 +74,7 @@ TRAIN_MICRO_BATCH_SIZE=1
 EXTERNAL_INFERENCE_URL="https://v6e-8-node-17.ohadrubin.com"
 
 # Precompile common sequence lengths to avoid JIT during training
-PRECOMPILE_SEQ_LENS=""
+PRECOMPILE_SEQ_LENS="${MIN_SEQ_LEN}"
 
 
 
