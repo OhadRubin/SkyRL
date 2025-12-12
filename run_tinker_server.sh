@@ -7,8 +7,6 @@ ts() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 ts "Starting Tinker server script"
 cd ~/SkyRL/skyrl-tx
-ts "Running git pull"
-git pull
 
 # HuggingFace cache configuration (use /dev/shm for fast access)
 export HF_CACHE=/dev/shm/huggingface_cache
@@ -100,13 +98,14 @@ ts "Reinstalling ringattention"
 uv pip install --reinstall ringattention --quiet
 rm -f uv.lock  # Remove lockfile to ensure local flax is used
 uv sync --extra tpu --extra tinker
+uv pip install -e ~/flax --reinstall  # Install flax as editable so rsync changes take effect
 RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/ringattention/__init__.py"
 sed -i 's/jax.lib.xla_bridge.get_backend/jax.extend.backend.get_backend/' "$RING_INIT"
 sed -i 's/^import jax$/import jax\nimport jax.extend/' "$RING_INIT"
 
 # Run the server
 # --gradient-checkpointing \
-uv run --extra tinker --extra tpu  -m tx.tinker.api \
+uv run --no-sync --extra tinker --extra tpu  -m tx.tinker.api \
     --checkpoints-base "${CHECKPOINTS_BASE}" \
     ${ADDITIONAL_FLAGS} \
     --base-model "${BASE_MODEL}" \

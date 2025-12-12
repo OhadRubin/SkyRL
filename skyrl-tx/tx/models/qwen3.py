@@ -512,34 +512,35 @@ class Qwen3Model(nnx.Module):
             # Unlike jax.lax.scan + manual split/merge, nnx.scan preserves gradient paths
             num_layers = self.config.num_hidden_layers
 
-            if kv_cache is not None:
-                stacked_keys = jnp.stack(kv_cache.keys, axis=0)
-                stacked_values = jnp.stack(kv_cache.values, axis=0)
-                cache_position = kv_cache.cache_position
+            if False:
+                pass # this commenting out is done for readability, we will uncomment it later, we aren't using it right now
+                # stacked_keys = jnp.stack(kv_cache.keys, axis=0)
+                # stacked_values = jnp.stack(kv_cache.values, axis=0)
+                # cache_position = kv_cache.cache_position
 
-                # Scan Params and RngState on axis 0, broadcast everything else
-                layer_state_axes = nnx.StateAxes({(nnx.Param, nnx.RngState): 0, ...: None})
+                # # Scan Params and RngState on axis 0, broadcast everything else
+                # layer_state_axes = nnx.StateAxes({(nnx.Param, nnx.RngState): 0, ...: None})
 
-                @nnx.scan(
-                    in_axes=(layer_state_axes, nnx.Carry, None, None, 0, 0),
-                    out_axes=(nnx.Carry, (0, 0)),
-                    length=num_layers,  # Explicit length helps XLA recognize this as a loop
-                    transform_metadata={nnx.PARTITION_NAME: 'layer'},
-                )
-                @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
-                def apply_layer_with_cache(layer, h, attn_mask, pos, k_cache, v_cache):
-                    h, (k, v) = layer(
-                        h,
-                        attention_mask=attn_mask,
-                        positions=pos,
-                        kv_cache=(k_cache, v_cache, cache_position),
-                    )
-                    return h, (k, v)
+                # @nnx.scan(
+                #     in_axes=(layer_state_axes, nnx.Carry, None, None, 0, 0),
+                #     out_axes=(nnx.Carry, (0, 0)),
+                #     length=num_layers,  # Explicit length helps XLA recognize this as a loop
+                #     transform_metadata={nnx.PARTITION_NAME: 'layer'},
+                # )
+                # @nnx.remat(policy=jax.checkpoint_policies.nothing_saveable, prevent_cse=False)
+                # def apply_layer_with_cache(layer, h, attn_mask, pos, k_cache, v_cache):
+                #     h, (k, v) = layer(
+                #         h,
+                #         attention_mask=attn_mask,
+                #         positions=pos,
+                #         kv_cache=(k_cache, v_cache, cache_position),
+                #     )
+                #     return h, (k, v)
 
-                hidden_states, (updated_keys, updated_values) = apply_layer_with_cache(
-                    self.layers, hidden_states, attention_mask, positions,
-                    stacked_keys, stacked_values
-                )
+                # hidden_states, (updated_keys, updated_values) = apply_layer_with_cache(
+                #     self.layers, hidden_states, attention_mask, positions,
+                #     stacked_keys, stacked_values
+                # )
             else:
                 # Scan Params and RngState on axis 0, broadcast everything else
                 layer_state_axes = nnx.StateAxes({(nnx.Param, nnx.RngState): 0, ...: None})
