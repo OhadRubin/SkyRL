@@ -19,8 +19,9 @@ LOG_FILE=""
 # MIN_SEQ_LEN=4096
 # MIN_SEQ_LEN=8192
 # MIN_SEQ_LEN=16384
-# MIN_SEQ_LEN=32768
-MIN_SEQ_LEN=59392
+MIN_SEQ_LEN=32768
+# MIN_SEQ_LEN=59392
+# MIN_SEQ_LEN=38912
 
 # 512*119=60928
 # 2048*29=59392
@@ -110,9 +111,9 @@ ts "Reinstalling ringattention"
 uv pip install --reinstall ringattention --quiet
 rm -f uv.lock  # Remove lockfile to ensure local flax is used
 uv sync --extra tpu --extra tinker
-uv pip install -e ~/maxtext --reinstall  # Install maxtext as editable so rsync changes take effect
+# uv pip install -e ~/maxtext --reinstall  # Install maxtext as editable so rsync changes take effect
 uv pip install -e ~/flax --reinstall  # Install flax as editable so rsync changes take effect
-RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.12/site-packages/ringattention/__init__.py"
+RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.11/site-packages/ringattention/__init__.py"
 sed -i 's/jax.lib.xla_bridge.get_backend/jax.extend.backend.get_backend/' "$RING_INIT"
 sed -i 's/^import jax$/import jax\nimport jax.extend/' "$RING_INIT"
 
