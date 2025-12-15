@@ -92,6 +92,8 @@ else
 fi
 export JAX_DUMP_IR_TO="/tmp/jax_ir_dump_${JAX_DUMP_TS}"
 LOG_FILE="/tmp/logs/${JAX_DUMP_TS}/tinker-api.log"
+
+
 mkdir -p "$(dirname "$LOG_FILE")"
 ts "JAX IR dump dir: ${JAX_DUMP_IR_TO}"
 ts "Log file: ${LOG_FILE}"

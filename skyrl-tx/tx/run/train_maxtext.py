@@ -28,6 +28,7 @@ from MaxText import model_creation_utils as maxtext_model_creation
 from MaxText import sharding as maxtext_sharding
 from MaxText.integration.tunix.tunix_adapter import TunixMaxTextAdapter
 
+from flax.nnx.nn.lora import LoRAParam
 
 def get_maxtext_base_config_path() -> str:
     """Get the absolute path to MaxText's base.yml config file."""
@@ -122,7 +123,9 @@ def main():
     # Create optimizer (SGD like maxtext_deploy.py uses)
     print("Creating SGD optimizer...",flush=True)
     tx = optax.sgd(learning_rate=1e-4)
-    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+    # optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+    lora_filter = nnx.All(nnx.Param, nnx.Any(nnx.PathContains("lora_a"), nnx.PathContains("lora_b")))
+    optimizer = nnx.Optimizer(model, tx, wrt=lora_filter)
     print("  Optimizer created",flush=True)
     print()
 
@@ -133,7 +136,8 @@ def main():
     def forward_backward(model, input_ids, positions, target_ids, loss_mask):
         def loss_wrapper(model):
             return loss_fn(model, input_ids, positions, target_ids, loss_mask)
-        loss, grads = nnx.value_and_grad(loss_wrapper)(model)
+        lora_filter = nnx.All(nnx.Param, nnx.Any(nnx.PathContains("lora_a"), nnx.PathContains("lora_b")))
+        loss, grads = nnx.value_and_grad(loss_wrapper, argnums=nnx.DiffState(0, lora_filter))(model)
         return loss, grads
 
     # Define optim_step (mutates optimizer state)
