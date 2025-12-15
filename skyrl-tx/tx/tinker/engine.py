@@ -118,6 +118,16 @@ def pad_batch(sequences: list[list], max_length: int, dtype, left: bool = False)
     return jnp.asarray(padded)
 
 
+def _count_params(pytree) -> int:
+    """Count total number of parameters in a pytree."""
+    def get_numel(x):
+        if hasattr(x, 'shape'):
+            return int(np.prod(x.shape))
+        return 0
+    counts = jax.tree.leaves(jax.tree.map(get_numel, pytree))
+    return sum(counts)
+
+
 @jax.tree_util.register_dataclass
 @dataclass
 class AccumulatedGradients:
@@ -196,12 +206,25 @@ class TinkerEngine:
                 self.model = TunixMaxTextAdapter(base_model=base_model)
                 self.model.config = None  # Match train_maxtext.py pattern
 
-            # No LoRA for MaxText path
-            self.model_config = None  # MaxText uses its own config
+            # MaxText uses its own config
+            self.model_config = None
             self.graphdef = None
-            self.lora_params = None
-            self.non_lora_params = None
-            self.accumulated_grads = None  # Will be initialized differently for MaxText
+
+            # Extract LoRA params for gradient accumulation (like train_maxtext.py)
+            lora_filter = nnx.All(nnx.Param, nnx.Any(nnx.PathContains("lora_a"), nnx.PathContains("lora_b")))
+            self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, lora_filter, ...)
+
+            # Initialize accumulated gradients for MaxText
+            self.accumulated_grads = AccumulatedGradients.create(self.lora_params)
+            accum_params = _count_params(self.accumulated_grads.grad_sum)
+            logger.info(f"[MaxText path] Accumulated grads total params: {accum_params / 1e6:.2f}M")
+            for path, val in jax.tree_util.tree_leaves_with_path(self.accumulated_grads.grad_sum):
+                path_str = "/".join(str(k.key) if hasattr(k, 'key') else str(k) for k in path)
+                logger.info(f"  {path_str}: {val.shape}")
+
+            # Create optimizer with lora_filter (like train_maxtext.py)
+            tx = optax.inject_hyperparams(optax.adamw)(learning_rate=1e-4)
+            self.maxtext_optimizer = nnx.Optimizer(self.model, tx, wrt=lora_filter)
 
             logger.info(f"Initialized MaxText model with context_parallel_size={self.maxtext_config.context_parallel_size}")
 
@@ -240,6 +263,11 @@ class TinkerEngine:
 
                 # Initialize global accumulated gradients
                 self.accumulated_grads = AccumulatedGradients.create(self.lora_params)
+                accum_params = _count_params(self.accumulated_grads.grad_sum)
+                logger.info(f"[LoRA path] Accumulated grads total params: {accum_params / 1e6:.2f}M")
+                for path, val in jax.tree_util.tree_leaves_with_path(self.accumulated_grads.grad_sum):
+                    path_str = "/".join(str(k.key) if hasattr(k, 'key') else str(k) for k in path)
+                    logger.info(f"  {path_str}: {val.shape}")
 
             logger.info(
                 f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
@@ -332,10 +360,11 @@ class TinkerEngine:
 
             return total_loss, (target_logprobs, per_token_losses)
 
-        # Full parameter gradients (no LoRA filter)
+        # LoRA filter for gradients (same as train_maxtext.py)
+        lora_filter = nnx.All(nnx.Param, nnx.Any(nnx.PathContains("lora_a"), nnx.PathContains("lora_b")))
         loss_and_grad_fn = nnx.value_and_grad(
             loss_for_maxtext_model,
-            argnums=nnx.DiffState(0, nnx.Param),  # All params
+            argnums=nnx.DiffState(0, lora_filter),
             has_aux=True
         )
 
@@ -369,6 +398,16 @@ class TinkerEngine:
                     in_shardings=(None, data_sharding, data_sharding, data_sharding, data_sharding),
                     # out_shardings will be inferred
                 )
+
+        # Create optim_step function (like train_maxtext.py)
+        def optim_step_maxtext(model, optimizer, grads):
+            """Apply gradients to optimizer (mutates state)."""
+            optimizer.update(model, grads)
+
+        if self.config.enforce_eager:
+            self._optim_step_maxtext = optim_step_maxtext
+        else:
+            self._optim_step_maxtext = nnx.jit(optim_step_maxtext)
 
         logger.info("Created MaxText loss and gradient functions")
 
@@ -507,17 +546,31 @@ class TinkerEngine:
 
                 if self.maxtext_config:
                     # MaxText path: use positions (TunixMaxTextAdapter signature, no segment_ids)
+                    from flax.linen import partitioning as nn_partitioning
                     dummy_positions = jnp.broadcast_to(jnp.arange(seq_len), (micro_bs, seq_len))
 
-                    with self._jit_timing_context(seq_len, mode="train"):
-                        # Run forward-backward to trigger JIT compilation (no gradient accumulation for now)
-                        _, _, _, _ = self._forward_backward_maxtext(
-                            self.model,
-                            dummy_input_ids,
-                            dummy_positions,
-                            dummy_target_ids,
-                            dummy_loss_mask,
-                        )
+                    # Shard inputs to match JIT in_shardings
+                    data_sharding = maxtext_sharding.get_input_data_sharding(self.maxtext_config, self.mesh)
+                    dummy_input_ids = jax.device_put(dummy_input_ids, data_sharding)
+                    dummy_positions = jax.device_put(dummy_positions, data_sharding)
+                    dummy_target_ids = jax.device_put(dummy_target_ids, data_sharding)
+                    dummy_loss_mask = jax.device_put(dummy_loss_mask, data_sharding)
+
+                    with nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
+                        with self._jit_timing_context(seq_len, mode="train"):
+                            # Run forward-backward to trigger JIT compilation
+                            _, _, _, grads = self._forward_backward_maxtext(
+                                self.model,
+                                dummy_input_ids,
+                                dummy_positions,
+                                dummy_target_ids,
+                                dummy_loss_mask,
+                            )
+                            # Accumulate grads like the real forward-backward path
+                            self.accumulated_grads = self.accumulated_grads.add(grads, micro_bs)
+
+                    # Reset accumulated grads after precompilation
+                    self.accumulated_grads = AccumulatedGradients.create(self.lora_params)
                 else:
                     # LoRA path
                     dummy_attention_mask = jnp.ones((micro_bs, seq_len), dtype=jnp.int32)
@@ -707,7 +760,11 @@ class TinkerEngine:
         with jax.set_mesh(self.mesh):
             # These values are always overridden by the hyperparams in the optim_step request.
             tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.0)
-            self.optimizers[model_id] = nnx.Optimizer(self.model, tx, wrt=self.model.is_lora_param)
+            if self.maxtext_config:
+                lora_filter = nnx.All(nnx.Param, nnx.Any(nnx.PathContains("lora_a"), nnx.PathContains("lora_b")))
+                self.optimizers[model_id] = nnx.Optimizer(self.model, tx, wrt=lora_filter)
+            else:
+                self.optimizers[model_id] = nnx.Optimizer(self.model, tx, wrt=self.model.is_lora_param)
 
         logger.info(f"Created LoRA model {model_id} with adapter index {adapter_index}, config {lora_config}")
 
@@ -720,9 +777,9 @@ class TinkerEngine:
     def _process_forward_backward_batch_maxtext(
         self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
-        """Process forward_backward requests using MaxText model (no LoRA).
+        """Process forward_backward requests using MaxText model with LoRA.
 
-        This is a simplified version for context parallelism testing.
+        Uses gradient accumulation like train_maxtext.py.
         """
         from flax.linen import partitioning as nn_partitioning
 
@@ -737,6 +794,9 @@ class TinkerEngine:
 
         for request_id, (model_id, request_data) in requests.items():
             request_start = len(all_input_ids)
+            if model_id not in self.models:
+                logger.warning(f"Model {model_id} not loaded, skipping forward_backward request")
+                continue
             for item in request_data.data:
                 tokens = [t for chunk in item.model_input.chunks for t in chunk.tokens]
                 all_input_ids.append(tokens)
@@ -760,6 +820,13 @@ class TinkerEngine:
 
         seq_lens = [len(seq) for seq in all_input_ids]
 
+        # Shard inputs to match JIT in_shardings
+        data_sharding = maxtext_sharding.get_input_data_sharding(self.maxtext_config, self.mesh)
+        input_ids = jax.device_put(input_ids, data_sharding)
+        positions = jax.device_put(positions, data_sharding)
+        target_ids = jax.device_put(target_ids, data_sharding)
+        loss_mask = jax.device_put(loss_mask, data_sharding)
+
         # Collect results
         token_losses_device = []
         logprobs_device = []
@@ -780,6 +847,10 @@ class TinkerEngine:
                         target_ids[mb_start:mb_end],
                         loss_mask[mb_start:mb_end],
                     )
+
+                    # Accumulate gradients (like train_maxtext.py pattern)
+                    micro_batch_size = mb_end - mb_start
+                    self.accumulated_grads = self.accumulated_grads.add(grads, micro_batch_size)
 
                     token_losses_device.append(per_token_losses)
                     logprobs_device.append(target_logprobs)
@@ -859,6 +930,9 @@ class TinkerEngine:
         for request_id, (model_id, request_data) in valid_requests.items():
             adapter_index = self.models[model_id].adapter_index
             loss_fn_type = LOSS_TYPES[request_data.loss_fn]
+            if model_id not in self.models:
+                logger.warning(f"Model {model_id} not loaded, skipping forward_backward request")
+                continue
 
             request_start = len(all_input_ids)
             for item in request_data.data:
@@ -990,6 +1064,9 @@ class TinkerEngine:
 
         for i, (request_id, (model_id, request_data)) in enumerate(valid_requests.items()):
             request_start = len(all_prompts)
+            if model_id not in self.models:
+                logger.warning(f"Model {model_id} not loaded, skipping sample request")
+                continue
 
             # Expand requests for num_samples (TODO: Once we have continuous batching /
             # paged attention, we should do the prefill only once and share the kv cache)
@@ -1059,33 +1136,60 @@ class TinkerEngine:
 
     def process_optim_step(self, model_id: str, request_data: types.OptimStepInput) -> types.OptimStepOutput:
         """Process an optim_step request and apply accumulated gradients."""
-        if model_id not in self.models:
-            raise ValueError(f"Model {model_id} not loaded")
-
-        adapter_index = jnp.int32(self.models[model_id].adapter_index)
-
         # Check if we have any gradients accumulated (count > 0)
         if self.accumulated_grads.count[0] == 0:
             logger.warning(f"No accumulated gradients for model {model_id}, skipping optimizer step")
             return types.OptimStepOutput()
+        if model_id not in self.models:
+            logger.warning(f"Model {model_id} not loaded, skipping optimizer step")
+            return types.OptimStepOutput()
 
-        # Update hyperparameters from the request
-        hp = self.optimizers[model_id].opt_state.hyperparams
-        hp["learning_rate"][...] = request_data.adam_params.learning_rate
-        hp["b1"][...] = request_data.adam_params.beta1
-        hp["b2"][...] = request_data.adam_params.beta2
-        hp["eps"][...] = request_data.adam_params.eps
+        if self.maxtext_config:
+            # === MaxText path: use maxtext_optimizer (like train_maxtext.py) ===
+            from flax.linen import partitioning as nn_partitioning
 
-        # JIT-compiled: compute full gradients, apply optimizer update, and reset accumulated grads
-        with jax.set_mesh(self.mesh):
-            self.accumulated_grads = self._compute_grads_and_update(
-                self.accumulated_grads,
-                self.lora_params,
-                self.optimizers[model_id],
-                adapter_index,
-            )
+            # Update hyperparameters from the request
+            hp = self.maxtext_optimizer.opt_state.hyperparams
+            hp["learning_rate"][...] = request_data.adam_params.learning_rate
+            hp["b1"][...] = request_data.adam_params.beta1
+            hp["b2"][...] = request_data.adam_params.beta2
+            hp["eps"][...] = request_data.adam_params.eps
 
-        logger.info(f"Applied optimizer step for model {model_id} (adapter {adapter_index})")
+            # Get mean gradients and apply optimizer step
+            mean_grads = self.accumulated_grads.get_mean()
+
+            with jax.set_mesh(self.mesh), nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
+                self._optim_step_maxtext(self.model, self.maxtext_optimizer, mean_grads)
+
+            # Reset accumulated gradients
+            self.accumulated_grads = self.accumulated_grads.reset()
+
+            logger.info(f"Applied MaxText optimizer step for model {model_id}")
+        else:
+            # === Qwen3 + LoRA path ===
+            if model_id not in self.models:
+                raise ValueError(f"Model {model_id} not loaded")
+
+            adapter_index = jnp.int32(self.models[model_id].adapter_index)
+
+            # Update hyperparameters from the request
+            hp = self.optimizers[model_id].opt_state.hyperparams
+            hp["learning_rate"][...] = request_data.adam_params.learning_rate
+            hp["b1"][...] = request_data.adam_params.beta1
+            hp["b2"][...] = request_data.adam_params.beta2
+            hp["eps"][...] = request_data.adam_params.eps
+
+            # JIT-compiled: compute full gradients, apply optimizer update, and reset accumulated grads
+            with jax.set_mesh(self.mesh):
+                self.accumulated_grads = self._compute_grads_and_update(
+                    self.accumulated_grads,
+                    self.lora_params,
+                    self.optimizers[model_id],
+                    adapter_index,
+                )
+
+            logger.info(f"Applied optimizer step for model {model_id} (adapter {adapter_index})")
+
         return types.OptimStepOutput()
 
     def process_load_weights(self, model_id: str, request_data: types.LoadWeightsInput) -> types.LoadWeightsOutput:

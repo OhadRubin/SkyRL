@@ -1,7 +1,7 @@
 #!/bin/bash
 # Script to run the Tinker API server on TPU
 
-set -e
+# set -e
 
 ts() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
@@ -9,12 +9,13 @@ ts "Starting Tinker server script"
 cd ~/SkyRL/skyrl-tx
 
 PYTHON_VERSION=3.12
+# PYTHON_VERSION=3.11
 # Create venv if it doesn't exist
-if [ ! -d ".venv" ]; then
-    ts "Creating virtual environment..."
-    uv venv --python ${PYTHON_VERSION} --seed .venv
-fi
-source .venv/bin/activate
+# if [ ! -d ".venv$PYTHON_VERSION" ]; then
+#     ts "Creating virtual environment..."
+#     uv venv --python ${PYTHON_VERSION} --seed .venv$PYTHON_VERSION
+# fi
+# source .venv$PYTHON_VERSION/bin/activate
 
 # HuggingFace cache configuration (use /dev/shm for fast access)
 export HF_CACHE=/dev/shm/huggingface_cache
@@ -24,15 +25,10 @@ export TRANSFORMERS_CACHE=/dev/shm/huggingface_cache
 
 ADDITIONAL_FLAGS=""
 LOG_FILE=""
-# MIN_SEQ_LEN=4096
-# MIN_SEQ_LEN=8192
-# MIN_SEQ_LEN=16384
-MIN_SEQ_LEN=32768
-# MIN_SEQ_LEN=59392
-# MIN_SEQ_LEN=38912
 
-# 512*119=60928
-# 2048*29=59392
+# MIN_SEQ_LEN=4096
+MIN_SEQ_LEN=65536
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --scan-layers)
@@ -129,20 +125,20 @@ sleep 2
 
 ts "Reinstalling ringattention"
 # Reinstall ringattention to get clean copy, then fix deprecated JAX API
-uv pip install --reinstall ringattention --quiet
-rm -f uv.lock  # Remove lockfile to ensure local flax is used
-uv sync --extra tpu --extra tinker
-uv pip install -e ~/maxtext --reinstall  # Install maxtext as editable so rsync changes take effect
-uv pip install -e ~/flax --reinstall  # Install flax as editable so rsync changes take effect
-RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python${PYTHON_VERSION}/site-packages/ringattention/__init__.py"
-sed -i 's/jax.lib.xla_bridge.get_backend/jax.extend.backend.get_backend/' "$RING_INIT"
-sed -i 's/^import jax$/import jax\nimport jax.extend/' "$RING_INIT"
+# uv pip install --reinstall ringattention --quiet
+# rm -f uv.lock  # Remove lockfile to ensure local flax is used
+# uv sync --extra tpu --extra tinker
+# uv pip install -e ~/maxtext --reinstall  # Install maxtext as editable so rsync changes take effect
+# uv pip install -e ~/flax --reinstall  # Install flax as editable so rsync changes take effect
+# RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv${PYTHON_VERSION}/lib/python${PYTHON_VERSION}/site-packages/ringattention/__init__.py"
+# sed -i 's/jax.lib.xla_bridge.get_backend/jax.extend.backend.get_backend/' "$RING_INIT"
+# sed -i 's/^import jax$/import jax\nimport jax.extend/' "$RING_INIT"
 
 ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --shard-attention-heads"
 # Run the server
 # --gradient-checkpointing \
 # Build command with optional maxtext config
-CMD=(uv run --no-sync --extra tinker --extra tpu -m tx.tinker.api
+CMD=(uv run  --extra tinker --extra tpu --reinstall-package flax --reinstall-package maxtext --refresh-package flax --refresh-package maxtext -m tx.tinker.api
     --checkpoints-base "${CHECKPOINTS_BASE}"
     ${ADDITIONAL_FLAGS}
     --base-model "${BASE_MODEL}"
