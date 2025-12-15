@@ -35,6 +35,7 @@ from tx.utils.models import (
     insert_adapter_state,
     round_up_seq_len,
     resolve_model_path,
+    convert_maxtext_lora_to_hf,
 )
 # update_adapter_config removed - single adapter mode
 from tx.utils.log import logger
@@ -1228,29 +1229,53 @@ class TinkerEngine:
         """
         Saves a clean training checkpoint by converting the trimmed NNX graph
         to a pure dictionary before serialization, following official Flax docs.
+
+        For MaxText path: saves in HuggingFace PEFT format using convert_maxtext_lora_to_hf.
+        For LoRA path: saves using Flax checkpoints format.
         """
         if model_id not in self.models:
             raise ValueError(f"Model {model_id} not loaded")
 
         checkpoint_id = request_data.path
-        output_path = self.config.checkpoints_base / model_id / f"{checkpoint_id}.tar.gz"
 
-        with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
-            with pack_and_upload(output_path) as temp_dir:
-                checkpoints.save_checkpoint(
-                    target=self._extract_checkpoint_data(model_id),
-                    ckpt_dir=temp_dir,
-                    step=0,
-                    prefix="checkpoint_",
-                    overwrite=True,
+        if self.maxtext_config:
+            # === MaxText path: save in HuggingFace PEFT format ===
+            output_path = self.config.checkpoints_base / model_id / checkpoint_id
+
+            with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
+                convert_maxtext_lora_to_hf(
+                    lora_state=self.lora_params,
+                    output_path=output_path,
+                    base_model_name=self.config.base_model,
+                    lora_rank=self.maxtext_config.lora_rank,
+                    lora_alpha=self.maxtext_config.lora_alpha,
                 )
+                logger.info(f"Saved MaxText LoRA checkpoint in HF format for model {model_id} to {output_path}")
 
-            logger.info(f"Saved trimmed training checkpoint for model {model_id} to {output_path}")
+            return types.SaveWeightsOutput(
+                path=f"tinker://{model_id}/weights/{checkpoint_id}",
+                type="save_weights",
+            )
+        else:
+            # === LoRA path: save using Flax checkpoints ===
+            output_path = self.config.checkpoints_base / model_id / f"{checkpoint_id}.tar.gz"
 
-        return types.SaveWeightsOutput(
-            path=f"tinker://{model_id}/weights/{checkpoint_id}",
-            type="save_weights",
-        )
+            with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
+                with pack_and_upload(output_path) as temp_dir:
+                    checkpoints.save_checkpoint(
+                        target=self._extract_checkpoint_data(model_id),
+                        ckpt_dir=temp_dir,
+                        step=0,
+                        prefix="checkpoint_",
+                        overwrite=True,
+                    )
+
+                logger.info(f"Saved trimmed training checkpoint for model {model_id} to {output_path}")
+
+            return types.SaveWeightsOutput(
+                path=f"tinker://{model_id}/weights/{checkpoint_id}",
+                type="save_weights",
+            )
 
     def process_save_weights_for_sampler(
         self, model_id: str, request_data: types.SaveWeightsForSamplerInput
