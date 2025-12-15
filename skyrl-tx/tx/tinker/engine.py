@@ -47,6 +47,7 @@ try:
     from MaxText import maxtext_utils
     from MaxText import model_creation_utils as maxtext_model_creation
     from MaxText import sharding as maxtext_sharding
+    from MaxText.integration.tunix.tunix_adapter import TunixMaxTextAdapter
     MAXTEXT_AVAILABLE = True
 except ImportError:
     MAXTEXT_AVAILABLE = False
@@ -186,11 +187,14 @@ class TinkerEngine:
             logger.info(f"Created MaxText mesh with shape {self.mesh.shape}, axes {self.mesh.axis_names}")
 
             # Create model using MaxText's model creation (includes checkpoint loading)
+            # Wrap with TunixMaxTextAdapter like train_maxtext.py does
             with jax.set_mesh(self.mesh):
-                self.model, _ = maxtext_model_creation.create_nnx_model(
+                base_model, _ = maxtext_model_creation.create_nnx_model(
                     self.maxtext_config,
                     mesh=self.mesh
                 )
+                self.model = TunixMaxTextAdapter(base_model=base_model)
+                self.model.config = None  # Match train_maxtext.py pattern
 
             # No LoRA for MaxText path
             self.model_config = None  # MaxText uses its own config
@@ -297,28 +301,26 @@ class TinkerEngine:
             self._create_lora_loss_and_grad_fn()
 
     def _create_maxtext_loss_and_grad_fn(self):
-        """Create loss and gradient functions for MaxText model (no LoRA)."""
-        from flax.nnx import partitioning as nn_partitioning
+        """Create loss and gradient functions for MaxText model (no LoRA).
+
+        Uses TunixMaxTextAdapter call signature from train_maxtext.py:
+            model(input_tokens, positions, cache, attention_mask, output_hidden_states)
+        """
+        from flax.linen import partitioning as nn_partitioning
 
         def loss_for_maxtext_model(
             model,
             input_ids: jax.Array,
             positions: jax.Array,
-            segment_ids: jax.Array,
             target_ids: jax.Array,
             loss_mask: jax.Array,
         ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
-            """Simple cross-entropy loss for MaxText model.
+            """Simple cross-entropy loss for MaxText model with TunixMaxTextAdapter.
 
-            MaxText NNX model signature (from train.py):
-                model(decoder_input_tokens, decoder_positions, decoder_segment_ids, ...)
+            TunixMaxTextAdapter signature: (input_tokens, positions, cache, attention_mask, output_hidden_states)
             """
-            # MaxText NNX model call with keyword args
-            logits = model(
-                decoder_input_tokens=input_ids,
-                decoder_positions=positions,
-                decoder_segment_ids=segment_ids,
-            )
+            # TunixMaxTextAdapter call (like train_maxtext.py:70)
+            logits, _ = model(input_ids, positions, None, None, False)
 
             logprobs = jax.nn.log_softmax(logits, axis=-1)  # [B, T, V]
             target_logprobs = jnp.take_along_axis(logprobs, target_ids[..., None], axis=-1).squeeze(-1)
@@ -341,7 +343,6 @@ class TinkerEngine:
             model,
             input_ids: jax.Array,
             positions: jax.Array,
-            segment_ids: jax.Array,
             target_ids: jax.Array,
             loss_mask: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array, nnx.State]:
@@ -350,7 +351,6 @@ class TinkerEngine:
                 model,
                 input_ids,
                 positions,
-                segment_ids,
                 target_ids,
                 loss_mask,
             )
@@ -362,11 +362,11 @@ class TinkerEngine:
         if self.config.enforce_eager:
             self._forward_backward_maxtext = forward_backward_maxtext
         else:
-            # JIT with MaxText's shardings
+            # JIT with MaxText's shardings (4 data inputs: input_ids, positions, target_ids, loss_mask)
             with jax.set_mesh(self.mesh), nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
                 self._forward_backward_maxtext = jax.jit(
                     forward_backward_maxtext,
-                    in_shardings=(None, data_sharding, data_sharding, data_sharding, data_sharding, data_sharding),
+                    in_shardings=(None, data_sharding, data_sharding, data_sharding, data_sharding),
                     # out_shardings will be inferred
                 )
 
@@ -500,15 +500,14 @@ class TinkerEngine:
             micro_bs = max(1, self.config.train_micro_batch_size) if self.config.train_micro_batch_size > 0 else 1
 
             for seq_len in seq_lens:
-                # Create dummy inputs for precompilation
+            # Create dummy inputs for precompilation
                 dummy_input_ids = jnp.zeros((micro_bs, seq_len), dtype=jnp.int32)
                 dummy_target_ids = jnp.zeros((micro_bs, seq_len), dtype=jnp.int32)
                 dummy_loss_mask = jnp.ones((micro_bs, seq_len), dtype=jnp.float32)
 
                 if self.maxtext_config:
-                    # MaxText path: use positions and segment_ids
+                    # MaxText path: use positions (TunixMaxTextAdapter signature, no segment_ids)
                     dummy_positions = jnp.broadcast_to(jnp.arange(seq_len), (micro_bs, seq_len))
-                    dummy_segment_ids = jnp.ones((micro_bs, seq_len), dtype=jnp.int32)
 
                     with self._jit_timing_context(seq_len, mode="train"):
                         # Run forward-backward to trigger JIT compilation (no gradient accumulation for now)
@@ -516,7 +515,6 @@ class TinkerEngine:
                             self.model,
                             dummy_input_ids,
                             dummy_positions,
-                            dummy_segment_ids,
                             dummy_target_ids,
                             dummy_loss_mask,
                         )
@@ -755,13 +753,10 @@ class TinkerEngine:
         target_ids = pad_batch(all_targets, max_len, np.int32)
         loss_mask = pad_batch(all_token_weights, max_len, np.float32)
 
-        # Create positions [0, 1, 2, ..., seq_len-1] for each batch element
+        # Create positions [0, 1, 2, ..., seq_len-1] for each batch element (like train_maxtext.py:61)
         batch_size = input_ids.shape[0]
         seq_len = input_ids.shape[1]
         positions = jnp.broadcast_to(jnp.arange(seq_len), (batch_size, seq_len))
-
-        # Segment IDs: 1 for real tokens, 0 for padding (MaxText uses this for packing)
-        segment_ids = pad_batch([[1] * len(seq) for seq in all_input_ids], max_len, np.int32)
 
         seq_lens = [len(seq) for seq in all_input_ids]
 
@@ -782,7 +777,6 @@ class TinkerEngine:
                         self.model,
                         input_ids[mb_start:mb_end],
                         positions[mb_start:mb_end],
-                        segment_ids[mb_start:mb_end],
                         target_ids[mb_start:mb_end],
                         loss_mask[mb_start:mb_end],
                     )

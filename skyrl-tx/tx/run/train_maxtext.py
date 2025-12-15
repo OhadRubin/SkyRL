@@ -13,6 +13,7 @@ Usage:
 import os
 import time
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -56,10 +57,10 @@ def get_maxtext_model(config, mesh):
 
 
 def create_dummy_batch(batch_size: int, seq_len: int):
-    """Create a dummy batch for testing."""
-    input_ids = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
+    """Create a dummy batch for testing with random input_ids."""
+    input_ids = jnp.array(np.random.randint(0, 150000, size=(batch_size, seq_len)), dtype=jnp.int32)
     positions = jnp.broadcast_to(jnp.arange(seq_len), (batch_size, seq_len))
-    target_ids = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
+    target_ids = jnp.array(np.random.randint(0, 150000, size=(batch_size, seq_len)), dtype=jnp.int32)
     loss_mask = jnp.ones((batch_size, seq_len), dtype=jnp.float32)
     return input_ids, positions, target_ids, loss_mask
 
@@ -107,57 +108,70 @@ def main():
     print("Creating device mesh...")
     devices_array = maxtext_utils.create_device_mesh(config)
     mesh = jax.sharding.Mesh(devices_array, config.mesh_axes)
-    print(f"  Mesh shape: {mesh.shape}")
-    print(f"  Mesh axes: {mesh.axis_names}")
+    print(f"  Mesh shape: {mesh.shape}",flush=True)
+    print(f"  Mesh axes: {mesh.axis_names}",flush=True)
     print()
 
     # Create model with TunixMaxTextAdapter (like train_rl.py)
     print("Creating MaxText model with TunixMaxTextAdapter...")
     start = time.time()
     model, mesh = get_maxtext_model(config, mesh)
-    print(f"  Model created in {time.time() - start:.1f}s")
+    print(f"  Model created in {time.time() - start:.1f}s",flush=True)
     print()
 
     # Create optimizer (SGD like maxtext_deploy.py uses)
-    print("Creating SGD optimizer...")
+    print("Creating SGD optimizer...",flush=True)
     tx = optax.sgd(learning_rate=1e-4)
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
-    print("  Optimizer created")
+    print("  Optimizer created",flush=True)
     print()
 
     # Get data sharding
     data_sharding = maxtext_sharding.get_input_data_sharding(config, mesh)
 
-    # Define train step
-    def train_step(model, optimizer, input_ids, positions, target_ids, loss_mask):
+    # Define forward_backward (returns loss and grads, no state mutation)
+    def forward_backward(model, input_ids, positions, target_ids, loss_mask):
         def loss_wrapper(model):
             return loss_fn(model, input_ids, positions, target_ids, loss_mask)
-
         loss, grads = nnx.value_and_grad(loss_wrapper)(model)
-        optimizer.update(model, grads)
-        return loss
+        return loss, grads
 
-    # JIT compile
-    print("JIT compiling train step...")
+    # Define optim_step (mutates optimizer state)
+    def optim_step(model, optimizer, grads):
+        optimizer.update(model, grads)
+
+    # JIT compile forward_backward with jax.jit (no state mutation)
+    print("JIT compiling forward_backward...",flush=True)
     with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
-        train_step_jit = jax.jit(
-            train_step,
-            in_shardings=(None, None, data_sharding, data_sharding, data_sharding, data_sharding),
+        forward_backward_jit = jax.jit(
+            forward_backward,
+            in_shardings=(None, data_sharding, data_sharding, data_sharding, data_sharding),
         )
 
+    # JIT compile optim_step with nnx.jit (mutates state)
+    print("JIT compiling optim_step...",flush=True)
+    optim_step_jit = nnx.jit(optim_step)
+
+    # Combined train_step that calls both - JIT with nnx.jit for state mutation
+    @nnx.jit
+    def train_step(model, optimizer, input_ids, positions, target_ids, loss_mask):
+        loss, grads = forward_backward_jit(model, input_ids, positions, target_ids, loss_mask)
+        optim_step_jit(model, optimizer, grads)
+        return loss
+
     # Run training steps
-    print(f"\nRunning {steps} training steps...")
+    print(f"\nRunning {steps} training steps...",flush=True)
     for step in range(steps):
         input_ids, positions, target_ids, loss_mask = create_dummy_batch(batch_size, seq_len)
 
         start = time.time()
         with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
-            loss = train_step_jit(model, optimizer, input_ids, positions, target_ids, loss_mask)
+            loss = train_step(model, optimizer, input_ids, positions, target_ids, loss_mask)
         jax.block_until_ready(loss)
         elapsed = time.time() - start
 
         loss_val = float(loss)
-        print(f"  Step {step}: loss={loss_val:.4f}, time={elapsed:.2f}s")
+        print(f"  Step {step}: loss={loss_val:.4f}, time={elapsed:.2f}s", flush=True)
 
     print("\n=== Test Complete ===")
 
