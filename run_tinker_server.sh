@@ -8,6 +8,14 @@ ts() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 ts "Starting Tinker server script"
 cd ~/SkyRL/skyrl-tx
 
+PYTHON_VERSION=3.12
+# Create venv if it doesn't exist
+if [ ! -d ".venv" ]; then
+    ts "Creating virtual environment..."
+    uv venv --python ${PYTHON_VERSION} --seed .venv
+fi
+source .venv/bin/activate
+
 # HuggingFace cache configuration (use /dev/shm for fast access)
 export HF_CACHE=/dev/shm/huggingface_cache
 export HF_HOME=/dev/shm/huggingface_cache
@@ -28,7 +36,7 @@ MIN_SEQ_LEN=32768
 while [[ $# -gt 0 ]]; do
     case $1 in
         --scan-layers)
-            ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --scan-layers --segment-length 8"
+            ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --scan-layers"
             shift
             ;;
         --dump-ts)
@@ -51,13 +59,24 @@ while [[ $# -gt 0 ]]; do
             ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --use-maxtext-moe"
             shift
             ;;
+        --maxtext-config)
+            # Pass MaxText config options as a string (e.g., "ici_context_parallelism=8 model_name=qwen3-30b-a3b")
+            MAXTEXT_CONFIG="$2"
+            shift 2
+            ;;
+        --smoke-test)
+            SMOKE_TEST=1
+            shift
+            ;;
         *)
             shift
             ;;
     esac
 done
 
-export JAX_LOG_COMPILES=1
+# MaxText config will be added separately to preserve quoting
+
+# export JAX_LOG_COMPILES=1
 export JAX_TRACEBACK_FILTERING=off
 export JAX_DUMP_IR_MODES='jaxpr'
 
@@ -97,8 +116,8 @@ TRAIN_MICRO_BATCH_SIZE=1
 EXTERNAL_INFERENCE_URL="https://v6e-8-node-17.ohadrubin.com"
 
 # Precompile common sequence lengths to avoid JIT during training
-# PRECOMPILE_SEQ_LENS="${MIN_SEQ_LEN}"
-PRECOMPILE_SEQ_LENS=""
+PRECOMPILE_SEQ_LENS="${MIN_SEQ_LEN}"
+# PRECOMPILE_SEQ_LENS=""
 
 
 
@@ -111,27 +130,44 @@ ts "Reinstalling ringattention"
 uv pip install --reinstall ringattention --quiet
 rm -f uv.lock  # Remove lockfile to ensure local flax is used
 uv sync --extra tpu --extra tinker
-# uv pip install -e ~/maxtext --reinstall  # Install maxtext as editable so rsync changes take effect
+uv pip install -e ~/maxtext --reinstall  # Install maxtext as editable so rsync changes take effect
 uv pip install -e ~/flax --reinstall  # Install flax as editable so rsync changes take effect
-RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python3.11/site-packages/ringattention/__init__.py"
+RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv/lib/python${PYTHON_VERSION}/site-packages/ringattention/__init__.py"
 sed -i 's/jax.lib.xla_bridge.get_backend/jax.extend.backend.get_backend/' "$RING_INIT"
 sed -i 's/^import jax$/import jax\nimport jax.extend/' "$RING_INIT"
 
 ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --shard-attention-heads"
 # Run the server
 # --gradient-checkpointing \
-uv run --no-sync --extra tinker --extra tpu  -m tx.tinker.api \
-    --checkpoints-base "${CHECKPOINTS_BASE}" \
-    ${ADDITIONAL_FLAGS} \
-    --base-model "${BASE_MODEL}" \
-    --tensor-parallel-size ${TENSOR_PARALLEL_SIZE} \
-    --max-lora-adapters ${MAX_LORA_ADAPTERS} \
-    --no-mlp-lora \
-    --no-embed-lora \
-    --max-lora-rank ${MAX_LORA_RANK} \
-    --train-micro-batch-size ${TRAIN_MICRO_BATCH_SIZE} \
-    --external-inference-url "${EXTERNAL_INFERENCE_URL}" \
-    --external-inference-lora-base "${EXTERNAL_LORA_BASE}" \
-    --precompile-seq-lens "${PRECOMPILE_SEQ_LENS}" \
-    --min-seq-len ${MIN_SEQ_LEN} \
-    2>&1 | tee "${LOG_FILE}"
+# Build command with optional maxtext config
+CMD=(uv run --no-sync --extra tinker --extra tpu -m tx.tinker.api
+    --checkpoints-base "${CHECKPOINTS_BASE}"
+    ${ADDITIONAL_FLAGS}
+    --base-model "${BASE_MODEL}"
+    --tensor-parallel-size ${TENSOR_PARALLEL_SIZE}
+    --max-lora-adapters ${MAX_LORA_ADAPTERS}
+    --no-mlp-lora
+    --no-embed-lora
+    --max-lora-rank ${MAX_LORA_RANK}
+    --train-micro-batch-size ${TRAIN_MICRO_BATCH_SIZE}
+    --external-inference-url "${EXTERNAL_INFERENCE_URL}"
+    --external-inference-lora-base "${EXTERNAL_LORA_BASE}"
+    --precompile-seq-lens "${PRECOMPILE_SEQ_LENS}"
+    --min-seq-len ${MIN_SEQ_LEN}
+)
+
+# Add maxtext config if provided (with proper quoting)
+if [ -n "$MAXTEXT_CONFIG" ]; then
+    CMD+=(--maxtext-config-str "${MAXTEXT_CONFIG}")
+fi
+
+# Run smoke test or full server
+if [ -n "$SMOKE_TEST" ] && [ -n "$MAXTEXT_CONFIG" ]; then
+    ts "Running smoke test with MaxText config..."
+    # train_maxtext.py finds base.yml path internally, just pass key=value pairs
+    uv run --no-sync --extra tinker --extra tpu python -m tx.run.train_maxtext \
+        ${MAXTEXT_CONFIG} \
+        2>&1 | tee "${LOG_FILE}"
+else
+    "${CMD[@]}" 2>&1 | tee "${LOG_FILE}"
+fi

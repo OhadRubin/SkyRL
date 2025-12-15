@@ -852,7 +852,7 @@ class Qwen3Model(nnx.Module):
                         attention_mask=attn_mask,
                         positions=pos,
                         kv_cache=None,
-                    )
+                )
                     # Ensure output dtype matches input dtype for scan compatibility
                     h = h.astype(input_dtype)
                     new_carry = (h, attn_mask, pos)

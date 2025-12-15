@@ -99,6 +99,10 @@ class EngineConfig(BaseModel):
         default=False,
         description="Use MaxText's RoutedMoE implementation for expert computation",
     )
+    maxtext_config_str: str = Field(
+        default="",
+        description="MaxText config as space-separated key=value pairs (e.g., 'ici_context_parallelism=8 model_name=qwen3-30b-a3b max_target_length=65536'). When set, uses MaxText model with context parallelism instead of Qwen3+LoRA.",
+    )
 
 
 def convert_env_var(env_name: str, env_value: str, expected_type: type):
