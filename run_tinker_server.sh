@@ -102,8 +102,8 @@ ts "Log file: ${LOG_FILE}"
 sudo chown -R $(whoami) /dev/shm/huggingface_cache
 # Date-based checkpoint path
 DATE=$(date +%Y%m%d)
-CHECKPOINTS_BASE="/dev/shm/gcs_bucket_mount/lora-experiments/${DATE}"
-EXTERNAL_LORA_BASE="/dev/shm/gcs_bucket_mount/lora-experiments/${DATE}"
+CHECKPOINTS_BASE="/dev/shm/gcs_bucket_mount/lora-experiments-checkpoints"
+EXTERNAL_LORA_BASE="/dev/shm/gcs_bucket_mount/lora-experiments"
 
 
 

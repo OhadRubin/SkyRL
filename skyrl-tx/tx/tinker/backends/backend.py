@@ -101,6 +101,24 @@ class AbstractBackend(ABC):
         pass
 
     @abstractmethod
+    def save_checkpoint(
+        self,
+        output_path,
+        model_id: str,
+        models: dict[str, types.ModelMetadata],
+        optimizers: dict[str, nnx.Optimizer],
+    ) -> None:
+        """Save training checkpoint to disk.
+
+        Args:
+            output_path: Path to save the checkpoint
+            model_id: The model identifier
+            models: Dict mapping model_id to ModelMetadata
+            optimizers: Dict mapping model_id to Optimizer
+        """
+        pass
+
+    @abstractmethod
     def extract_checkpoint_data(
         self,
         model_id: str,
@@ -129,6 +147,22 @@ class AbstractBackend(ABC):
             checkpoint_data: Dictionary from extract_checkpoint_data or loaded from disk
             models: Dict mapping model_id to ModelMetadata
             optimizers: Dict mapping model_id to Optimizer
+        """
+        pass
+
+    @abstractmethod
+    def save_sampler_checkpoint(
+        self,
+        output_path,
+        model_id: str,
+        models: dict[str, types.ModelMetadata],
+    ) -> None:
+        """Save sampler checkpoint to disk as tar.gz.
+
+        Args:
+            output_path: Path to save the checkpoint tar.gz file
+            model_id: The model identifier
+            models: Dict mapping model_id to ModelMetadata
         """
         pass
 

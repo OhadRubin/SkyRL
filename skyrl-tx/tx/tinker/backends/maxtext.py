@@ -15,6 +15,7 @@ from tx.tinker import types
 from tx.tinker.config import EngineConfig
 from tx.tinker.backends.backend import AbstractBackend
 from tx.utils.models import round_up_seq_len, convert_maxtext_lora_to_hf
+from tx.utils.storage import pack_and_upload
 from tx.utils.log import logger
 
 # MaxText imports
@@ -428,6 +429,24 @@ class MaxTextBackend(AbstractBackend):
         """Process sample requests - not implemented for MaxText."""
         raise NotImplementedError("Sampling not yet implemented for MaxText backend")
 
+    def save_checkpoint(
+        self,
+        output_path,
+        model_id: str,
+        models: dict[str, types.ModelMetadata],
+        optimizers: dict[str, nnx.Optimizer],
+    ) -> None:
+        """Save training checkpoint in HuggingFace PEFT format as tar.gz."""
+        with pack_and_upload(output_path) as temp_dir:
+            convert_maxtext_lora_to_hf(
+                lora_state=self.lora_params,
+                output_path=temp_dir,
+                base_model_name=self.config.base_model,
+                lora_rank=self.maxtext_config.lora_rank,
+                lora_alpha=self.maxtext_config.lora_alpha,
+            )
+        logger.info(f"Saved MaxText training checkpoint to {output_path}")
+
     def extract_checkpoint_data(
         self,
         model_id: str,
@@ -450,6 +469,23 @@ class MaxTextBackend(AbstractBackend):
     ) -> None:
         """Insert checkpoint data - not implemented for MaxText."""
         raise NotImplementedError("Loading checkpoints not yet implemented for MaxText backend")
+
+    def save_sampler_checkpoint(
+        self,
+        output_path,
+        model_id: str,
+        models: dict[str, types.ModelMetadata],
+    ) -> None:
+        """Save sampler checkpoint in HuggingFace PEFT format as tar.gz."""
+        with pack_and_upload(output_path) as temp_dir:
+            convert_maxtext_lora_to_hf(
+                lora_state=self.lora_params,
+                output_path=temp_dir,
+                base_model_name=self.config.base_model,
+                lora_rank=self.maxtext_config.lora_rank,
+                lora_alpha=self.maxtext_config.lora_alpha,
+            )
+        logger.info(f"Saved MaxText LoRA sampler checkpoint to {output_path}")
 
     def extract_sampler_weights(
         self,

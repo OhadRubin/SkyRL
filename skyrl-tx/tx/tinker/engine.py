@@ -15,8 +15,7 @@ from tx.tinker.db_models import FutureDB, RequestStatus, CheckpointDB, Checkpoin
 from tx.tinker import types
 from tx.tinker.config import EngineConfig, add_model
 from tx.tinker.backends import AbstractBackend, MaxTextBackend, NativeBackend, parse_maxtext_config
-from tx.utils.storage import download_and_unpack, pack_and_upload
-from tx.utils.models import save_lora_checkpoint, convert_maxtext_lora_to_hf
+from tx.utils.storage import download_and_unpack
 from tx.utils.log import logger
 
 
@@ -270,108 +269,34 @@ class TinkerEngine:
         return types.LoadWeightsOutput(type="load_weights")
 
     def process_save_weights(self, model_id: str, request_data: types.SaveWeightsInput) -> types.SaveWeightsOutput:
-        """Saves a clean training checkpoint.
-
-        Handles file I/O (upload), delegates state extraction to backend.
-        For MaxText: saves in HuggingFace PEFT format.
-        For Native: saves using Flax checkpoints format.
-        """
+        """Saves a clean training checkpoint."""
         if model_id not in self.models:
             raise ValueError(f"Model {model_id} not loaded")
 
         checkpoint_id = request_data.path
+        output_path = self.config.checkpoints_base / model_id / f"{checkpoint_id}.tar.gz"
 
-        if self.maxtext_config:
-            # MaxText path: save in HuggingFace PEFT format
-            output_path = self.config.checkpoints_base / model_id / checkpoint_id
+        with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
+            self.backend.save_checkpoint(output_path, model_id, self.models, self.optimizers)
 
-            with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
-                checkpoint_data = self.backend.extract_checkpoint_data(model_id, self.models, self.optimizers)
-                convert_maxtext_lora_to_hf(
-                    lora_state=checkpoint_data["lora_params"],
-                    output_path=output_path,
-                    base_model_name=self.config.base_model,
-                    lora_rank=checkpoint_data["lora_rank"],
-                    lora_alpha=checkpoint_data["lora_alpha"],
-                )
-                logger.info(f"Saved MaxText LoRA checkpoint in HF format for model {model_id} to {output_path}")
-
-            return types.SaveWeightsOutput(
-                path=f"tinker://{model_id}/weights/{checkpoint_id}",
-                type="save_weights",
-            )
-        else:
-            # Native path: save using Flax checkpoints
-            output_path = self.config.checkpoints_base / model_id / f"{checkpoint_id}.tar.gz"
-
-            with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
-                with pack_and_upload(output_path) as temp_dir:
-                    checkpoint_data = self.backend.extract_checkpoint_data(model_id, self.models, self.optimizers)
-                    checkpoints.save_checkpoint(
-                        target=checkpoint_data,
-                        ckpt_dir=temp_dir,
-                        step=0,
-                        prefix="checkpoint_",
-                        overwrite=True,
-                    )
-
-                logger.info(f"Saved trimmed training checkpoint for model {model_id} to {output_path}")
-
-            return types.SaveWeightsOutput(
-                path=f"tinker://{model_id}/weights/{checkpoint_id}",
-                type="save_weights",
-            )
+        return types.SaveWeightsOutput(
+            path=f"tinker://{model_id}/weights/{checkpoint_id}",
+            type="save_weights",
+        )
 
     def process_save_weights_for_sampler(
         self, model_id: str, request_data: types.SaveWeightsForSamplerInput
     ) -> types.SaveWeightsForSamplerOutput:
-        """Save model weights for sampler checkpoint.
-
-        Handles file I/O (upload), delegates state extraction to backend.
-        """
+        """Save model weights for sampler checkpoint."""
         if model_id not in self.models:
             raise ValueError(f"Model {model_id} not loaded")
 
-        lora_model = self.models[model_id]
-
         # Make sure the user cannot store checkpoints in places like ../../<important file>
         checkpoint_id = Path(request_data.path).name
+        output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
 
-        if self.maxtext_config:
-            # MaxText path: save in HuggingFace PEFT format
-            output_path = self.config.checkpoints_base / model_id / "sampler_weights" / checkpoint_id
-
-            with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
-                checkpoint_data = self.backend.extract_sampler_weights(model_id, self.models)
-                convert_maxtext_lora_to_hf(
-                    lora_state=checkpoint_data["lora_params"],
-                    output_path=output_path,
-                    base_model_name=self.config.base_model,
-                    lora_rank=checkpoint_data["lora_rank"],
-                    lora_alpha=checkpoint_data["lora_alpha"],
-                )
-                logger.info(
-                    f"Saved MaxText LoRA sampler checkpoint in HF format for model {model_id} to {output_path}"
-                )
-        else:
-            # Native path: save using save_lora_checkpoint
-            output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
-
-            with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
-                # Get weights data from backend
-                weights_data = self.backend.extract_sampler_weights(model_id, self.models)
-                # Save the LoRA adapter weights and LoRA config as tar.gz
-                save_lora_checkpoint(
-                    weights_data["model"],
-                    weights_data["base_model"],
-                    weights_data["lora_config"],
-                    weights_data["adapter_index"],
-                    output_path
-                )
-
-                logger.info(
-                    f"Saved LoRA adapter weights for model {model_id} (adapter {lora_model.adapter_index}) to {output_path}"
-                )
+        with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
+            self.backend.save_sampler_checkpoint(output_path, model_id, self.models)
 
         return types.SaveWeightsForSamplerOutput(
             path=f"tinker://{model_id}/{checkpoint_id}",

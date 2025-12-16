@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
+from flax.training import checkpoints
 from transformers import PretrainedConfig
 
 from tx.models.configs import Qwen3Config
@@ -21,11 +22,13 @@ from tx.utils.models import (
     get_model_class,
     load_safetensors,
     load_lora_checkpoint,
+    save_lora_checkpoint,
     extract_adapter_state,
     insert_adapter_state,
     round_up_seq_len,
     resolve_model_path,
 )
+from tx.utils.storage import pack_and_upload
 from tx.utils.log import logger
 
 
@@ -562,6 +565,25 @@ class NativeBackend(AbstractBackend):
 
         return results
 
+    def save_checkpoint(
+        self,
+        output_path,
+        model_id: str,
+        models: dict[str, types.ModelMetadata],
+        optimizers: dict[str, nnx.Optimizer],
+    ) -> None:
+        """Save training checkpoint as tar.gz using Flax checkpoints."""
+        with pack_and_upload(output_path) as temp_dir:
+            checkpoint_data = self.extract_checkpoint_data(model_id, models, optimizers)
+            checkpoints.save_checkpoint(
+                target=checkpoint_data,
+                ckpt_dir=temp_dir,
+                step=0,
+                prefix="checkpoint_",
+                overwrite=True,
+            )
+        logger.info(f"Saved training checkpoint to {output_path}")
+
     def extract_checkpoint_data(
         self,
         model_id: str,
@@ -597,6 +619,22 @@ class NativeBackend(AbstractBackend):
 
         insert_adapter_state(adapter_index, self.lora_params, checkpoint_data["lora_weights"], rank)
         insert_adapter_state(adapter_index, nnx.state(optimizers[model_id]), checkpoint_data["optimizer_state"], rank)
+
+    def save_sampler_checkpoint(
+        self,
+        output_path,
+        model_id: str,
+        models: dict[str, types.ModelMetadata],
+    ) -> None:
+        """Save sampler checkpoint as tar.gz using save_lora_checkpoint."""
+        save_lora_checkpoint(
+            self.model,
+            self.config.base_model,
+            models[model_id].lora_config,
+            models[model_id].adapter_index,
+            output_path,
+        )
+        logger.info(f"Saved LoRA sampler checkpoint to {output_path}")
 
     def extract_sampler_weights(
         self,
