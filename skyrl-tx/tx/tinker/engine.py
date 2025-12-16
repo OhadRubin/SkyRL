@@ -793,10 +793,12 @@ class TinkerEngine:
         all_token_weights = []
         request_batch_slices = []
 
+        results = {}
         for request_id, (model_id, request_data) in requests.items():
             request_start = len(all_input_ids)
             if model_id not in self.models:
                 logger.warning(f"Model {model_id} not loaded, skipping forward_backward request")
+                results[request_id] = types.ErrorResponse(error=f"Model {model_id} not loaded", status="failed")
                 continue
             for item in request_data.data:
                 tokens = [t for chunk in item.model_input.chunks for t in chunk.tokens]
@@ -806,6 +808,10 @@ class TinkerEngine:
                 all_token_weights.append(loss_fn_inputs.weights.data)
 
             request_batch_slices.append((request_id, model_id, request_start, len(all_input_ids)))
+
+        # Return error results if no valid requests to process
+        if not all_input_ids:
+            return results
 
         # Pad sequences to same length
         max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids), self.config.min_seq_len)
@@ -835,11 +841,14 @@ class TinkerEngine:
         total_bs = batch_size
         micro_bs = self._micro_batch_size(total_bs)
 
+        import time
+
         with jax.set_mesh(self.mesh), nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
             with self._jit_timing_context(seq_len, mode="train"):
                 for mb_start in range(0, total_bs, micro_bs):
                     mb_end = min(mb_start + micro_bs, total_bs)
-                    logger.info(f"MaxText forward-backward: batch [{mb_start}:{mb_end}], seq_len={seq_len}")
+                    print(f"MaxText forward-backward: batch [{mb_start}:{mb_end}], seq_len={seq_len}", flush=True)
+                    tic = time.time()
 
                     _, target_logprobs, per_token_losses, grads = self._forward_backward_maxtext(
                         self.model,
@@ -847,6 +856,20 @@ class TinkerEngine:
                         positions[mb_start:mb_end],
                         target_ids[mb_start:mb_end],
                         loss_mask[mb_start:mb_end],
+                    )
+
+                    # Block until target_logprobs is read (forces execution)
+                    _ = jax.device_get(target_logprobs)
+
+                    took = time.time() - tic
+                    # Calculate tokens per second
+                    tokens_processed = (mb_end - mb_start) * seq_len
+                    tokens_per_sec = tokens_processed / took if took > 0 else float('nan')
+
+                    print(
+                        f"Batch [{mb_start}:{mb_end}] forward-backward time: {took:.3f} sec, "
+                        f"tokens/sec: {tokens_per_sec:,.1f}",
+                        flush=True,
                     )
 
                     # Accumulate gradients (like train_maxtext.py pattern)
@@ -869,8 +892,7 @@ class TinkerEngine:
                 logprobs_out.append(mb_logprobs[i, :seq_lens[idx]].astype(jnp.float32))
                 idx += 1
 
-        # Build results
-        results = {}
+        # Build results (add to existing results dict which may contain errors)
         for request_id, _, start_idx, end_idx in request_batch_slices:
             loss_fn_outputs = []
             for i in range(start_idx, end_idx):
@@ -931,10 +953,6 @@ class TinkerEngine:
         for request_id, (model_id, request_data) in valid_requests.items():
             adapter_index = self.models[model_id].adapter_index
             loss_fn_type = LOSS_TYPES[request_data.loss_fn]
-            if model_id not in self.models:
-                logger.warning(f"Model {model_id} not loaded, skipping forward_backward request")
-                continue
-
             request_start = len(all_input_ids)
             for item in request_data.data:
                 tokens = [t for chunk in item.model_input.chunks for t in chunk.tokens]
@@ -949,6 +967,10 @@ class TinkerEngine:
                 all_loss_fn_types.append(loss_fn_type)
 
             request_batch_slices.append((request_id, model_id, request_start, len(all_input_ids)))
+
+        # Return if no data to process (e.g., all requests had empty data)
+        if not all_input_ids:
+            return results
 
         # Pad sequences to same length. Also bin it so the JIT has to compile fewer kernels.
         max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids), self.config.min_seq_len)
@@ -1288,17 +1310,35 @@ class TinkerEngine:
 
         # Make sure the user cannot store checkpoints in places like ../../<important file>
         checkpoint_id = Path(request_data.path).name
-        output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
 
-        with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
-            # Save the LoRA adapter weights and LoRA config as tar.gz
-            save_lora_checkpoint(
-                self.model, self.config.base_model, lora_model.lora_config, lora_model.adapter_index, output_path
-            )
+        if self.maxtext_config:
+            # === MaxText path: save in HuggingFace PEFT format ===
+            output_path = self.config.checkpoints_base / model_id / "sampler_weights" / checkpoint_id
 
-            logger.info(
-                f"Saved LoRA adapter weights for model {model_id} (adapter {lora_model.adapter_index}) to {output_path}"
-            )
+            with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
+                convert_maxtext_lora_to_hf(
+                    lora_state=self.lora_params,
+                    output_path=output_path,
+                    base_model_name=self.config.base_model,
+                    lora_rank=self.maxtext_config.lora_rank,
+                    lora_alpha=self.maxtext_config.lora_alpha,
+                )
+                logger.info(
+                    f"Saved MaxText LoRA sampler checkpoint in HF format for model {model_id} to {output_path}"
+                )
+        else:
+            # === LoRA path: save using save_lora_checkpoint ===
+            output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
+
+            with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
+                # Save the LoRA adapter weights and LoRA config as tar.gz
+                save_lora_checkpoint(
+                    self.model, self.config.base_model, lora_model.lora_config, lora_model.adapter_index, output_path
+                )
+
+                logger.info(
+                    f"Saved LoRA adapter weights for model {model_id} (adapter {lora_model.adapter_index}) to {output_path}"
+                )
 
         return types.SaveWeightsForSamplerOutput(
             path=f"tinker://{model_id}/{checkpoint_id}",
@@ -1387,7 +1427,8 @@ class TinkerEngine:
             case types.RequestType.SAVE_WEIGHTS:
                 return self.process_save_weights(model_id, types.SaveWeightsInput.model_validate(request_data))
             case types.RequestType.LOAD_WEIGHTS:
-                return self.process_load_weights(model_id, types.LoadWeightsInput.model_validate(request_data))
+                pass
+                # return self.process_load_weights(model_id, types.LoadWeightsInput.model_validate(request_data))
             case _:
                 raise ValueError(f"Unknown request type: {request_type}")
 
