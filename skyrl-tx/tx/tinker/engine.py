@@ -224,7 +224,7 @@ class TinkerEngine:
                 logger.info(f"  {path_str}: {val.shape}")
 
             # Create optimizer with lora_filter (like train_maxtext.py)
-            tx = optax.inject_hyperparams(optax.adamw)(learning_rate=1e-4)
+            tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.0)
             self.maxtext_optimizer = nnx.Optimizer(self.model, tx, wrt=lora_filter)
 
             logger.info(f"Initialized MaxText model with context_parallel_size={self.maxtext_config.context_parallel_size}")
