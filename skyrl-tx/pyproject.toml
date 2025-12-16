@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [
     "datasets>=4.0.0",
-    "flax @ file:///home/ohadr/flax",
+    "flax",
     "maxtext @ file:///home/ohadr/maxtext",
     "optax>=0.2.5",
     "pillow>=11.3.0",

@@ -473,13 +473,3 @@ class MaxTextBackend(AbstractBackend):
         """Insert sampler weights - not implemented for MaxText."""
         raise NotImplementedError("Loading sampler weights not yet implemented for MaxText backend")
 
-    def save_checkpoint_hf_format(self, output_path) -> None:
-        """Save checkpoint in HuggingFace PEFT format."""
-        convert_maxtext_lora_to_hf(
-            lora_state=self.lora_params,
-            output_path=output_path,
-            base_model_name=self.config.base_model,
-            lora_rank=self.maxtext_config.lora_rank,
-            lora_alpha=self.maxtext_config.lora_alpha,
-        )
-        logger.info(f"Saved MaxText LoRA checkpoint in HF format for model to {output_path}")

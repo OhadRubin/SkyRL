@@ -1,6 +1,6 @@
 """Abstract backend interface for TinkerEngine.
 
-⏺ Summary of Changes
+Backends handle all model state and computation. The engine handles file I/O and database operations.
 
   1. AbstractBackend (backend.py)
 
@@ -13,42 +13,23 @@
   2. MaxTextBackend (maxtext.py)
 
   - Implements all abstract methods
-  - process_sample_batch → raises NotImplementedError
-  - insert_checkpoint_data → raises NotImplementedError
-  - insert_sampler_weights → raises NotImplementedError
-  - Added save_checkpoint_hf_format() helper for HF PEFT format
-  - Added parse_maxtext_config() function (moved from engine)
+  - process_sample_batch -> raises NotImplementedError
+  - insert_checkpoint_data -> raises NotImplementedError
+  - insert_sampler_weights -> raises NotImplementedError
+  - Added parse_maxtext_config() function
 
   3. NativeBackend (native.py)
 
-  - Implements all abstract methods
-  - Removed file I/O - no more download_and_unpack, pack_and_upload
+  - Implements all abstract methods fully
   - extract_checkpoint_data / insert_checkpoint_data - pure state extraction/insertion
   - extract_sampler_weights / insert_sampler_weights - pure state manipulation
 
-  4. TinkerEngine (engine.py) - NOT YET DONE
+  4. TinkerEngine (engine.py)
 
-  Still needs to be refactored to:
-  - Instantiate MaxTextBackend or NativeBackend based on config
-  - Delegate computation to self.backend
-  - Keep all file I/O (download_and_unpack, pack_and_upload)
-  - Keep all database operations
-
-  Separation of Concerns
-
-  | Responsibility           | Backend | Engine |
-  |--------------------------|---------|--------|
-  | Model init/state         | ✅      |        |
-  | Forward/backward         | ✅      |        |
-  | Optimizer step           | ✅      |        |
-  | Sampling                 | ✅      |        |
-  | State extract/insert     | ✅      |        |
-  | File I/O                 |         | ✅     |
-  | Database ops             |         | ✅     |
-  | Request scheduling       |         | ✅     |
-  | Model/optimizer registry |         | ✅     |
-
-
+  - Instantiates MaxTextBackend or NativeBackend based on config
+  - Delegates computation to self.backend
+  - Handles all file I/O (download_and_unpack, pack_and_upload)
+  - Handles all database operations
 """
 
 from abc import ABC, abstractmethod

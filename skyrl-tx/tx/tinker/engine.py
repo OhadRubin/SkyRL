@@ -3,178 +3,35 @@
 import argparse
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from pydantic import BaseModel
 from sqlmodel import create_engine, Session, select, update, func
 
-import numpy as np
-import jax
-import jax.numpy as jnp
 from flax import nnx
 from flax.training import checkpoints
 
-
-import optax
-from transformers import PretrainedConfig
-
-from tx.models.configs import Qwen3Config
 from tx.tinker.db_models import FutureDB, RequestStatus, CheckpointDB, CheckpointStatus
 from tx.tinker import types
 from tx.tinker.config import EngineConfig, add_model
-from tx.tinker.loss_fns import LOSS_TYPES, LOSS_FUNCTIONS
+from tx.tinker.backends import AbstractBackend, MaxTextBackend, NativeBackend, parse_maxtext_config
 from tx.utils.storage import download_and_unpack, pack_and_upload
-from tx.utils.models import (
-    get_dtype,
-    get_model_class,
-    save_lora_checkpoint,
-    load_lora_checkpoint,
-    load_safetensors,
-    extract_adapter_state,
-    insert_adapter_state,
-    round_up_seq_len,
-    resolve_model_path,
-    convert_maxtext_lora_to_hf,
-)
-# update_adapter_config removed - single adapter mode
+from tx.utils.models import save_lora_checkpoint, convert_maxtext_lora_to_hf
 from tx.utils.log import logger
-
-# MaxText imports for context parallelism support
-import os
-try:
-    import MaxText
-    from MaxText import pyconfig as maxtext_pyconfig
-    from MaxText import maxtext_utils
-    from MaxText import model_creation_utils as maxtext_model_creation
-    from MaxText import sharding as maxtext_sharding
-    from MaxText.integration.tunix.tunix_adapter import TunixMaxTextAdapter
-    MAXTEXT_AVAILABLE = True
-except ImportError:
-    MAXTEXT_AVAILABLE = False
-    logger.warning("MaxText not available. Context parallelism via maxtext_config_str will not work.")
-
-
-def _get_maxtext_base_config_path() -> str:
-    """Get the absolute path to MaxText's base.yml config file."""
-    if not MAXTEXT_AVAILABLE:
-        return ""
-    # MaxText is installed as editable, so find the package root
-    maxtext_pkg_dir = os.path.dirname(MaxText.__file__)  # .../src/MaxText
-    maxtext_root = os.path.dirname(os.path.dirname(maxtext_pkg_dir))  # .../maxtext
-    config_path = os.path.join(maxtext_root, "src", "MaxText", "configs", "base.yml")
-    if not os.path.exists(config_path):
-        # Fallback: try relative to home directory (editable install location)
-        config_path = os.path.expanduser("~/maxtext/src/MaxText/configs/base.yml")
-    return config_path
-
-
-def _parse_maxtext_config(config_str: str):
-    """Parse MaxText config from space-separated key=value string.
-
-    Args:
-        config_str: Space-separated key=value pairs, e.g.,
-            "ici_context_parallelism=8 model_name=qwen3-30b-a3b max_target_length=65536"
-
-    Returns:
-        MaxTextConfig if config_str is non-empty and MaxText is available, else None
-    """
-    if not config_str or not MAXTEXT_AVAILABLE:
-        return None
-    # Build argv-style list for pyconfig.initialize()
-    # Format: ["program_name", "config_file_path", "key=value", "key=value", ...]
-    config_path = _get_maxtext_base_config_path()
-    logger.info(f"Using MaxText config: {config_path}")
-    argv = ["", config_path] + config_str.split()
-    return maxtext_pyconfig.initialize(argv)
-
-
-def pad(xs, pad_to: int, *, fill):
-    """Pad a list to a specified length with a fill value."""
-    return xs + ([fill] * (pad_to - len(xs)))
-
-
-def pad_batch(sequences: list[list], max_length: int, dtype, left: bool = False) -> jax.Array:
-    """Pad a batch of sequences to max_length.
-
-    Args:
-        sequences: List of sequences to pad.
-        max_length: Target length for all sequences.
-        dtype: NumPy dtype for the output array.
-        left: If True, use left-padding (tokens at end). Required for autoregressive
-            generation so the last position corresponds to the last real token.
-            If False (default), use right-padding (tokens at start).
-
-    Returns:
-        A JAX array of shape (batch_size, max_length) with the padded sequences.
-    """
-    batch_size = len(sequences)
-    padded = np.zeros((batch_size, max_length), dtype=dtype)
-    for i, seq in enumerate(sequences):
-        assert len(seq) <= max_length, f"Sequence length {len(seq)} exceeds max_length {max_length}"
-        if left:
-            padded[i, max_length - len(seq) :] = seq
-        else:
-            padded[i, : len(seq)] = seq
-    return jnp.asarray(padded)
-
-
-def _count_params(pytree) -> int:
-    """Count total number of parameters in a pytree."""
-    def get_numel(x):
-        if hasattr(x, 'shape'):
-            return int(np.prod(x.shape))
-        return 0
-    counts = jax.tree.leaves(jax.tree.map(get_numel, pytree))
-    return sum(counts)
-
-
-@jax.tree_util.register_dataclass
-@dataclass
-class AccumulatedGradients:
-    """Stores accumulated gradients."""
-
-    grad_sum: nnx.State
-    count: jax.Array
-
-    @classmethod
-    def create(cls, lora_params: nnx.State) -> "AccumulatedGradients":
-        """Initialize with zeros."""
-        return cls(
-            grad_sum=jax.tree.map(jnp.zeros_like, lora_params),
-            count=jnp.zeros((1,), dtype=jnp.int32),
-        )
-
-    def add(self, lora_grads: nnx.State, batch_size: int) -> "AccumulatedGradients":
-        """Accumulate gradients and increment count."""
-        return AccumulatedGradients(
-            grad_sum=jax.tree.map(lambda a, b: a + b, self.grad_sum, lora_grads),
-            count=self.count + batch_size,
-        )
-
-    def get_mean(self) -> nnx.State:
-        """Compute mean gradients."""
-        return jax.tree.map(
-            lambda g: g / self.count.astype(g.dtype),
-            self.grad_sum,
-        )
-
-    def reset(self) -> "AccumulatedGradients":
-        """Reset gradients and count."""
-        return AccumulatedGradients(
-            grad_sum=jax.tree.map(jnp.zeros_like, self.grad_sum),
-            count=jnp.zeros((1,), dtype=jnp.int32),
-        )
 
 
 class TinkerEngine:
-    """Background engine for processing training requests."""
+    """Background engine for processing training requests.
+
+    Handles file I/O, database operations, and request scheduling.
+    Delegates computation to the appropriate backend (MaxTextBackend or NativeBackend).
+    """
 
     def __init__(
         self,
         config: EngineConfig,
     ):
-        """Initialize the engine with a database connection and base model."""
+        """Initialize the engine with a database connection and backend."""
         self.config = config
         self.db_engine = create_engine(config.database_url, echo=False)
 
@@ -182,112 +39,22 @@ class TinkerEngine:
         self.models: dict[str, types.ModelMetadata] = {}
         # Store optimizer instances per LoRA adapter (model_id -> optimizer)
         self.optimizers: dict[str, nnx.Optimizer] = {}
-        # Metrics recorded in the engine
-        self.metrics = types.EngineMetrics()
 
         # Parse MaxText config if provided (for context parallelism)
-        self.maxtext_config = _parse_maxtext_config(self.config.maxtext_config_str)
+        self.maxtext_config = parse_maxtext_config(self.config.maxtext_config_str)
 
+        # Instantiate appropriate backend
         if self.maxtext_config:
-            # === MaxText path: context parallelism, no LoRA ===
-            logger.info(f"Using MaxText model with config: {self.config.maxtext_config_str}")
-
-            # Create mesh using MaxText's device mesh creation
-            devices_array = maxtext_utils.create_device_mesh(self.maxtext_config)
-            self.mesh = jax.sharding.Mesh(devices_array, self.maxtext_config.mesh_axes)
-            logger.info(f"Created MaxText mesh with shape {self.mesh.shape}, axes {self.mesh.axis_names}")
-
-            # Create model using MaxText's model creation (includes checkpoint loading)
-            # Wrap with TunixMaxTextAdapter like train_maxtext.py does
-            with jax.set_mesh(self.mesh):
-                base_model, _ = maxtext_model_creation.create_nnx_model(
-                    self.maxtext_config,
-                    mesh=self.mesh
-                )
-                self.model = TunixMaxTextAdapter(base_model=base_model)
-                self.model.config = None  # Match train_maxtext.py pattern
-
-            # MaxText uses its own config
-            self.model_config = None
-            self.graphdef = None
-
-            # Extract LoRA params for gradient accumulation (like train_maxtext.py)
-            lora_filter = nnx.All(nnx.Param, nnx.Any(nnx.PathContains("lora_a"), nnx.PathContains("lora_b")))
-            self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, lora_filter, ...)
-
-            # Initialize accumulated gradients for MaxText
-            self.accumulated_grads = AccumulatedGradients.create(self.lora_params)
-            accum_params = _count_params(self.accumulated_grads.grad_sum)
-            logger.info(f"[MaxText path] Accumulated grads total params: {accum_params / 1e6:.2f}M")
-            for path, val in jax.tree_util.tree_leaves_with_path(self.accumulated_grads.grad_sum):
-                path_str = "/".join(str(k.key) if hasattr(k, 'key') else str(k) for k in path)
-                logger.info(f"  {path_str}: {val.shape}")
-
-            # Create optimizer with lora_filter (like train_maxtext.py)
-            tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.0)
-            self.maxtext_optimizer = nnx.Optimizer(self.model, tx, wrt=lora_filter)
-
-            logger.info(f"Initialized MaxText model with context_parallel_size={self.maxtext_config.context_parallel_size}")
-
+            logger.info(f"Using MaxText backend with config: {self.config.maxtext_config_str}")
+            self.backend: AbstractBackend = MaxTextBackend(config, self.maxtext_config)
         else:
-            # === Existing path: Qwen3 + LoRA ===
-            # Initialize the shared base model with LoRA config
-            checkpoint_path = resolve_model_path(self.config.base_model)
-            base_config = PretrainedConfig.from_pretrained(checkpoint_path)
-            self.model_config = Qwen3Config(
-                base_config,
-                max_lora_rank=self.config.max_lora_rank,
-                shard_attention_heads=self.config.shard_attention_heads,
-                mlp_lora=self.config.mlp_lora,
-                attn_lora=self.config.attn_lora,
-                embed_lora=self.config.embed_lora,
-                scan_layers=self.config.scan_layers,
-                segment_length=self.config.segment_length,
-                use_ring_attention=self.config.use_ring_attention,
-                scan_query_chunk_size=self.config.scan_query_chunk_size,
-                scan_key_chunk_size=self.config.scan_key_chunk_size,
-                use_fused_moe=self.config.use_fused_moe,
-                use_maxtext_moe=self.config.use_maxtext_moe,
-            )
+            logger.info("Using Native backend")
+            self.backend: AbstractBackend = NativeBackend(config)
 
-            model_class = get_model_class(self.model_config)
-
-            # Create model and load weights
-            self.mesh = jax.make_mesh((1, 1, self.config.tensor_parallel_size), ("layer", "dp", "tensor"))
-            with jax.set_mesh(self.mesh):
-                self.model = model_class(self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0), mesh=self.mesh)
-                if self.config.load_safetensors:
-                    load_safetensors(checkpoint_path, self.model_config, self.model, reshape_for_scan=self.model_config.reshape_for_scan)
-
-                # Split model into LoRA and non-LoRA parameters
-                self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, self.model.is_lora_param, ...)
-
-                # Initialize global accumulated gradients
-                self.accumulated_grads = AccumulatedGradients.create(self.lora_params)
-                accum_params = _count_params(self.accumulated_grads.grad_sum)
-                logger.info(f"[LoRA path] Accumulated grads total params: {accum_params / 1e6:.2f}M")
-                for path, val in jax.tree_util.tree_leaves_with_path(self.accumulated_grads.grad_sum):
-                    path_str = "/".join(str(k.key) if hasattr(k, 'key') else str(k) for k in path)
-                    logger.info(f"  {path_str}: {val.shape}")
-
-            logger.info(
-                f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
-            )
-
-        self._create_loss_and_grad_fn()
-        self._precompile_kernels()
-
-    def _extract_checkpoint_data(self, model_id: str) -> dict:
-        """Extract adapter state and optimizer state for checkpointing."""
-        adapter_index = self.models[model_id].adapter_index
-        rank = self.models[model_id].lora_config.rank
-        lora_weights = extract_adapter_state(adapter_index, self.lora_params, rank)
-        optimizer_state = extract_adapter_state(adapter_index, nnx.state(self.optimizers[model_id]), rank)
-        return {
-            "lora_weights": lora_weights,
-            "optimizer_state": optimizer_state,
-            "lora_config": self.models[model_id].lora_config.model_dump(),
-        }
+        # Precompile kernels if requested
+        if self.config.precompile_seq_lens:
+            seq_lens = [int(s.strip()) for s in self.config.precompile_seq_lens.split(",") if s.strip()]
+            self.backend.precompile_kernels(seq_lens)
 
     @contextmanager
     def _checkpoint_status_context(self, model_id: str, checkpoint_id: str, checkpoint_type: types.CheckpointType):
@@ -315,335 +82,6 @@ class TinkerEngine:
                 checkpoint_db.completed_at = datetime.now(timezone.utc)
                 session.add(checkpoint_db)
                 session.commit()
-
-    def _create_loss_and_grad_fn(self):
-        """Compile and cache the loss function using nnx.value_and_grad.
-
-        For Qwen3+LoRA: Uses DiffState to filter gradients to LoRA params only.
-        For MaxText: Uses full-parameter gradients with MaxText's sharding.
-        """
-        if self.maxtext_config:
-            # === MaxText path: simplified loss for full-parameter training ===
-            self._create_maxtext_loss_and_grad_fn()
-        else:
-            # === Existing path: Qwen3 + LoRA ===
-            self._create_lora_loss_and_grad_fn()
-
-    def _create_maxtext_loss_and_grad_fn(self):
-        """Create loss and gradient functions for MaxText model (no LoRA).
-
-        Uses TunixMaxTextAdapter call signature from train_maxtext.py:
-            model(input_tokens, positions, cache, attention_mask, output_hidden_states)
-        """
-        from flax.linen import partitioning as nn_partitioning
-
-        def loss_for_maxtext_model(
-            model,
-            input_ids: jax.Array,
-            positions: jax.Array,
-            target_ids: jax.Array,
-            loss_mask: jax.Array,
-        ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
-            """Simple cross-entropy loss for MaxText model with TunixMaxTextAdapter.
-
-            TunixMaxTextAdapter signature: (input_tokens, positions, cache, attention_mask, output_hidden_states)
-            """
-            # TunixMaxTextAdapter call (like train_maxtext.py:70)
-            logits, _ = model(input_ids, positions, None, None, False)
-
-            logprobs = jax.nn.log_softmax(logits, axis=-1)  # [B, T, V]
-            target_logprobs = jnp.take_along_axis(logprobs, target_ids[..., None], axis=-1).squeeze(-1)
-
-            # Simple cross-entropy loss (negative log prob of targets)
-            per_token_losses = -target_logprobs * loss_mask
-            per_seq_loss = per_token_losses.sum(axis=-1) / (loss_mask.sum(axis=-1) + 1e-8)
-            total_loss = per_seq_loss.sum()
-
-            return total_loss, (target_logprobs, per_token_losses)
-
-        # LoRA filter for gradients (same as train_maxtext.py)
-        lora_filter = nnx.All(nnx.Param, nnx.Any(nnx.PathContains("lora_a"), nnx.PathContains("lora_b")))
-        loss_and_grad_fn = nnx.value_and_grad(
-            loss_for_maxtext_model,
-            argnums=nnx.DiffState(0, lora_filter),
-            has_aux=True
-        )
-
-        def forward_backward_maxtext(
-            model,
-            input_ids: jax.Array,
-            positions: jax.Array,
-            target_ids: jax.Array,
-            loss_mask: jax.Array,
-        ) -> tuple[jax.Array, jax.Array, jax.Array, nnx.State]:
-            """Forward-backward for MaxText model. Returns loss, logprobs, per_token_losses, grads."""
-            (loss, (target_logprobs, per_token_losses)), grads = loss_and_grad_fn(
-                model,
-                input_ids,
-                positions,
-                target_ids,
-                loss_mask,
-            )
-            return loss, target_logprobs, per_token_losses, grads
-
-        # Get data sharding from MaxText config
-        data_sharding = maxtext_sharding.get_input_data_sharding(self.maxtext_config, self.mesh)
-
-        if self.config.enforce_eager:
-            self._forward_backward_maxtext = forward_backward_maxtext
-        else:
-            # JIT with MaxText's shardings (4 data inputs: input_ids, positions, target_ids, loss_mask)
-            with jax.set_mesh(self.mesh), nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
-                self._forward_backward_maxtext = jax.jit(
-                    forward_backward_maxtext,
-                    in_shardings=(None, data_sharding, data_sharding, data_sharding, data_sharding),
-                    # out_shardings will be inferred
-                )
-
-        # Create optim_step function (like train_maxtext.py)
-        def optim_step_maxtext(model, optimizer, grads):
-            """Apply gradients to optimizer (mutates state)."""
-            optimizer.update(model, grads)
-
-        if self.config.enforce_eager:
-            self._optim_step_maxtext = optim_step_maxtext
-        else:
-            self._optim_step_maxtext = nnx.jit(optim_step_maxtext)
-
-        logger.info("Created MaxText loss and gradient functions")
-
-    def _create_lora_loss_and_grad_fn(self):
-        """Create loss and gradient functions for Qwen3+LoRA model."""
-        def loss_for_model(
-            model,
-            input_ids: jax.Array,
-            attention_mask: jax.Array,
-            target_ids: jax.Array,
-            loss_mask: jax.Array,
-            loss_fn_types: jax.Array,
-            sampling_logprobs: jax.Array,
-            advantages: jax.Array,
-        ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
-            output = model(input_ids, attention_mask=attention_mask)
-            logits = output.logits  # [B, T, V]
-
-            logprobs = jax.nn.log_softmax(logits, axis=-1)  # [B, T, V]
-            target_logprobs = jnp.take_along_axis(logprobs, target_ids[..., None], axis=-1).squeeze(-1)
-
-            def compute_loss_per_example(loss_fn_type, target_logprobs, loss_mask, sampling_logprobs, advantages):
-                return jax.lax.switch(
-                    loss_fn_type,
-                    LOSS_FUNCTIONS,
-                    target_logprobs,
-                    loss_mask,
-                    sampling_logprobs,
-                    advantages,
-                )
-
-            per_token_losses = jax.vmap(compute_loss_per_example)(
-                loss_fn_types,
-                target_logprobs,
-                loss_mask,
-                sampling_logprobs,
-                advantages,
-            )
-
-            per_seq_loss = per_token_losses.sum(axis=-1) / loss_mask.sum(axis=-1)
-            return per_seq_loss.sum(), (target_logprobs, per_token_losses)
-
-        # Use nnx.value_and_grad with DiffState to filter to LoRA params only
-        lora_filter = nnx.All(nnx.Param, nnx.Any(nnx.PathContains("lora_a"), nnx.PathContains("lora_b")))
-        loss_and_grad_fn = nnx.value_and_grad(
-            loss_for_model,
-            argnums=nnx.DiffState(0, lora_filter),
-            has_aux=True
-        )
-
-        def forward_backward_and_accumulate(
-            accumulated_grads: AccumulatedGradients,
-            model,
-            input_ids: jax.Array,
-            attention_mask: jax.Array,
-            target_ids: jax.Array,
-            loss_mask: jax.Array,
-            loss_fn_types: jax.Array,
-            sampling_logprobs: jax.Array,
-            advantages: jax.Array,
-        ) -> tuple[AccumulatedGradients, jax.Array, jax.Array, jax.Array]:
-            """Fused forward-backward-accumulate operation using nnx.value_and_grad."""
-            (loss, (target_logprobs, per_token_losses)), lora_grads = loss_and_grad_fn(
-                model,
-                input_ids,
-                attention_mask,
-                target_ids,
-                loss_mask,
-                loss_fn_types,
-                sampling_logprobs,
-                advantages,
-            )
-
-            # Accumulate gradients
-            batch_size = input_ids.shape[0]
-            new_accumulated_grads = accumulated_grads.add(lora_grads, batch_size)
-            return new_accumulated_grads, per_token_losses, target_logprobs, loss
-
-        if self.config.enforce_eager:
-            self._forward_backward_and_accumulate = forward_backward_and_accumulate
-        else:
-            # Get shardings from lora_params (they have nnx.with_partitioning)
-            lora_shardings = jax.tree.map(
-                lambda x: jax.NamedSharding(self.mesh, x.sharding.spec), self.lora_params
-            )
-            accumulated_grads_shardings = AccumulatedGradients(
-                grad_sum=lora_shardings,
-                count=jax.NamedSharding(self.mesh, jax.P(None)),
-            )
-            replicated = jax.NamedSharding(self.mesh, jax.P(None))
-            scalar = jax.NamedSharding(self.mesh, jax.P())
-
-            # Use jax.jit with explicit shardings (nnx.jit can't handle nnx.State in shardings)
-            self._forward_backward_and_accumulate = jax.jit(
-                forward_backward_and_accumulate,
-                in_shardings=(accumulated_grads_shardings, None, replicated, replicated, replicated, replicated, replicated, replicated, replicated),
-                out_shardings=(accumulated_grads_shardings, replicated, replicated, scalar),
-                donate_argnames=("accumulated_grads",),
-            )
-
-        # JIT-compiled function to compute full gradients and apply optimizer update
-        def compute_grads_and_update(
-            accumulated_grads: AccumulatedGradients,
-            lora_params: nnx.State,
-            optimizer: nnx.Optimizer,
-            adapter_index: jax.Array,
-        ) -> AccumulatedGradients:
-            """Compute full gradients, apply optimizer update, and reset accumulated grads."""
-            optimizer.update(lora_params, accumulated_grads.get_mean())
-            return accumulated_grads.reset()
-
-        if self.config.enforce_eager:
-            self._compute_grads_and_update = compute_grads_and_update
-        else:
-            self._compute_grads_and_update = nnx.jit(compute_grads_and_update)
-
-    def _precompile_kernels(self):
-        """Precompile JIT kernels for specified sequence lengths to avoid compilation during training."""
-        if not self.config.precompile_seq_lens or self.config.enforce_eager:
-            return
-
-        seq_lens = [int(s.strip()) for s in self.config.precompile_seq_lens.split(",") if s.strip()]
-        if not seq_lens:
-            return
-
-        logger.info(f"Precompiling JIT kernels for sequence lengths: {seq_lens}")
-
-        with jax.set_mesh(self.mesh):
-            micro_bs = max(1, self.config.train_micro_batch_size) if self.config.train_micro_batch_size > 0 else 1
-
-            for seq_len in seq_lens:
-            # Create dummy inputs for precompilation
-                dummy_input_ids = jnp.zeros((micro_bs, seq_len), dtype=jnp.int32)
-                dummy_target_ids = jnp.zeros((micro_bs, seq_len), dtype=jnp.int32)
-                dummy_loss_mask = jnp.ones((micro_bs, seq_len), dtype=jnp.float32)
-
-                if self.maxtext_config:
-                    # MaxText path: use positions (TunixMaxTextAdapter signature, no segment_ids)
-                    from flax.linen import partitioning as nn_partitioning
-                    dummy_positions = jnp.broadcast_to(jnp.arange(seq_len), (micro_bs, seq_len))
-
-                    # Shard inputs to match JIT in_shardings
-                    data_sharding = maxtext_sharding.get_input_data_sharding(self.maxtext_config, self.mesh)
-                    dummy_input_ids = jax.device_put(dummy_input_ids, data_sharding)
-                    dummy_positions = jax.device_put(dummy_positions, data_sharding)
-                    dummy_target_ids = jax.device_put(dummy_target_ids, data_sharding)
-                    dummy_loss_mask = jax.device_put(dummy_loss_mask, data_sharding)
-
-                    with nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
-                        with self._jit_timing_context(seq_len, mode="train"):
-                            # Run forward-backward to trigger JIT compilation
-                            _, _, _, grads = self._forward_backward_maxtext(
-                                self.model,
-                                dummy_input_ids,
-                                dummy_positions,
-                                dummy_target_ids,
-                                dummy_loss_mask,
-                            )
-                            # Accumulate grads like the real forward-backward path
-                            self.accumulated_grads = self.accumulated_grads.add(grads, micro_bs)
-
-                    # Reset accumulated grads after precompilation
-                    self.accumulated_grads = AccumulatedGradients.create(self.lora_params)
-                else:
-                    # LoRA path
-                    dummy_attention_mask = jnp.ones((micro_bs, seq_len), dtype=jnp.int32)
-                    dummy_loss_fn_types = jnp.zeros((micro_bs,), dtype=jnp.int32)
-                    dummy_sampling_logprobs = jnp.zeros((micro_bs, seq_len), dtype=jnp.float32)
-                    dummy_advantages = jnp.zeros((micro_bs, seq_len), dtype=jnp.float32)
-
-                    with self._jit_timing_context(seq_len, mode="train"):
-                        # Run forward-backward to trigger JIT compilation
-                        self.accumulated_grads, _, _, _ = self._forward_backward_and_accumulate(
-                            self.accumulated_grads,
-                            self.model,
-                            dummy_input_ids,
-                            dummy_attention_mask,
-                            dummy_target_ids,
-                            dummy_loss_mask,
-                            dummy_loss_fn_types,
-                            dummy_sampling_logprobs,
-                            dummy_advantages,
-                        )
-
-                    # Reset accumulated grads after precompilation
-                    self.accumulated_grads = AccumulatedGradients.create(self.lora_params)
-
-        logger.info(f"Precompilation complete for {len(seq_lens)} sequence lengths")
-
-    def _micro_batch_size(self, total: int) -> int:
-        """Return effective micro-batch size; 0/absent => disabled (use full fused batch)."""
-        mb = self.config.train_micro_batch_size
-        return total if mb <= 0 else max(1, min(mb, total))
-
-    @contextmanager
-    def _jit_timing_context(self, seq_len: int, mode: str):
-        """Context manager to track JIT compilation times for different sequence lengths.
-
-        Args:
-            seq_len: The sequence length being compiled
-            mode: Either 'train' or 'sample' to track separately
-        """
-        jit_times = self.metrics.train_seq_len_jit_times if mode == "train" else self.metrics.sample_seq_len_jit_times
-        if not self.config.enforce_eager and seq_len not in jit_times:
-            logger.info(f"JIT compiling for {mode} seq_len={seq_len} in progress...")
-            start_time = time.time()
-            yield
-            elapsed = time.time() - start_time
-            jit_times[seq_len] = elapsed
-            logger.info(f"JIT compilation for {mode} seq_len={seq_len} took {elapsed:.2f}s")
-        else:
-            yield
-
-    def _filter_valid_requests(
-        self,
-        requests: dict[str, tuple[str, any]],
-    ) -> tuple[dict[str, any], dict[str, tuple[str, any]]]:
-        """Filter out requests with invalid model_ids and return error results for them.
-
-        Args:
-            requests: Dict mapping request_id to (model_id, request_data) tuples
-
-        Returns:
-            Tuple of (error_results, valid_requests)
-        """
-        results = {}
-        valid_requests = {}
-
-        for request_id, (model_id, request_data) in requests.items():
-            if model_id and model_id not in self.models:
-                results[request_id] = types.ErrorResponse(error=f"Model {model_id} not loaded", status="failed")
-            else:
-                valid_requests[request_id] = (model_id, request_data)
-
-        return results, valid_requests
 
     def find_batchable_forward_backward(self, session: Session) -> dict[str, tuple[str, types.ForwardBackwardInput]]:
         """Find all forward_backward ops that come before any destructive update for their model.
@@ -742,10 +180,6 @@ class TinkerEngine:
         # Assign adapter index for this model_id
         adapter_index = max((m.adapter_index for m in self.models.values()), default=0) + 1
 
-        # if adapter_index >= self.config.max_lora_adapters:
-            # raise ValueError(f"Maximum number of LoRA adapters ({self.config.max_lora_adapters}) reached")
-        # adapter_index = 0
-
         # Extract LoRA configuration
         lora_config = request_data.lora_config
 
@@ -758,14 +192,8 @@ class TinkerEngine:
             lora_config=lora_config,
         )
 
-        with jax.set_mesh(self.mesh):
-            # These values are always overridden by the hyperparams in the optim_step request.
-            tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.0)
-            if self.maxtext_config:
-                lora_filter = nnx.All(nnx.Param, nnx.Any(nnx.PathContains("lora_a"), nnx.PathContains("lora_b")))
-                self.optimizers[model_id] = nnx.Optimizer(self.model, tx, wrt=lora_filter)
-            else:
-                self.optimizers[model_id] = nnx.Optimizer(self.model, tx, wrt=self.model.is_lora_param)
+        # Create optimizer via backend
+        self.optimizers[model_id] = self.backend.create_optimizer(model_id)
 
         logger.info(f"Created LoRA model {model_id} with adapter index {adapter_index}, config {lora_config}")
 
@@ -775,485 +203,78 @@ class TinkerEngine:
             lora_config=request_data.lora_config,
         )
 
-    def _process_forward_backward_batch_maxtext(
-        self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]
-    ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
-        """Process forward_backward requests using MaxText model with LoRA.
-
-        Uses gradient accumulation like train_maxtext.py.
-        """
-        from flax.linen import partitioning as nn_partitioning
-
-        if not requests:
-            return {}
-
-        # Collect all examples
-        all_input_ids = []
-        all_targets = []
-        all_token_weights = []
-        request_batch_slices = []
-
-        results = {}
-        for request_id, (model_id, request_data) in requests.items():
-            request_start = len(all_input_ids)
-            if model_id not in self.models:
-                logger.warning(f"Model {model_id} not loaded, skipping forward_backward request")
-                results[request_id] = types.ErrorResponse(error=f"Model {model_id} not loaded", status="failed")
-                continue
-            for item in request_data.data:
-                tokens = [t for chunk in item.model_input.chunks for t in chunk.tokens]
-                all_input_ids.append(tokens)
-                loss_fn_inputs = item.loss_fn_inputs
-                all_targets.append(loss_fn_inputs.target_tokens.data)
-                all_token_weights.append(loss_fn_inputs.weights.data)
-
-            request_batch_slices.append((request_id, model_id, request_start, len(all_input_ids)))
-
-        # Return error results if no valid requests to process
-        if not all_input_ids:
-            return results
-
-        # Pad sequences to same length
-        max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids), self.config.min_seq_len)
-
-        input_ids = pad_batch(all_input_ids, max_len, np.int32)
-        target_ids = pad_batch(all_targets, max_len, np.int32)
-        loss_mask = pad_batch(all_token_weights, max_len, np.float32)
-
-        # Create positions [0, 1, 2, ..., seq_len-1] for each batch element (like train_maxtext.py:61)
-        batch_size = input_ids.shape[0]
-        seq_len = input_ids.shape[1]
-        positions = jnp.broadcast_to(jnp.arange(seq_len), (batch_size, seq_len))
-
-        seq_lens = [len(seq) for seq in all_input_ids]
-
-        # Shard inputs to match JIT in_shardings
-        data_sharding = maxtext_sharding.get_input_data_sharding(self.maxtext_config, self.mesh)
-        input_ids = jax.device_put(input_ids, data_sharding)
-        positions = jax.device_put(positions, data_sharding)
-        target_ids = jax.device_put(target_ids, data_sharding)
-        loss_mask = jax.device_put(loss_mask, data_sharding)
-
-        # Collect results
-        token_losses_device = []
-        logprobs_device = []
-
-        total_bs = batch_size
-        micro_bs = self._micro_batch_size(total_bs)
-
-        import time
-
-        with jax.set_mesh(self.mesh), nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
-            with self._jit_timing_context(seq_len, mode="train"):
-                for mb_start in range(0, total_bs, micro_bs):
-                    mb_end = min(mb_start + micro_bs, total_bs)
-                    print(f"MaxText forward-backward: batch [{mb_start}:{mb_end}], seq_len={seq_len}", flush=True)
-                    tic = time.time()
-
-                    _, target_logprobs, per_token_losses, grads = self._forward_backward_maxtext(
-                        self.model,
-                        input_ids[mb_start:mb_end],
-                        positions[mb_start:mb_end],
-                        target_ids[mb_start:mb_end],
-                        loss_mask[mb_start:mb_end],
-                    )
-
-                    # Block until target_logprobs is read (forces execution)
-                    _ = jax.device_get(target_logprobs)
-
-                    took = time.time() - tic
-                    # Calculate tokens per second
-                    tokens_processed = (mb_end - mb_start) * seq_len
-                    tokens_per_sec = tokens_processed / took if took > 0 else float('nan')
-
-                    print(
-                        f"Batch [{mb_start}:{mb_end}] forward-backward time: {took:.3f} sec, "
-                        f"tokens/sec: {tokens_per_sec:,.1f}",
-                        flush=True,
-                    )
-
-                    # Accumulate gradients (like train_maxtext.py pattern)
-                    micro_batch_size = mb_end - mb_start
-                    self.accumulated_grads = self.accumulated_grads.add(grads, micro_batch_size)
-
-                    token_losses_device.append(per_token_losses)
-                    logprobs_device.append(target_logprobs)
-
-        # Device-to-host transfer
-        token_losses_host, logprobs_host = jax.device_get((token_losses_device, logprobs_device))
-
-        # Flatten and slice to actual lengths
-        token_losses_out = []
-        logprobs_out = []
-        idx = 0
-        for mb_losses, mb_logprobs in zip(token_losses_host, logprobs_host):
-            for i in range(mb_losses.shape[0]):
-                token_losses_out.append(mb_losses[i, :seq_lens[idx]].astype(jnp.float32))
-                logprobs_out.append(mb_logprobs[i, :seq_lens[idx]].astype(jnp.float32))
-                idx += 1
-
-        # Build results (add to existing results dict which may contain errors)
-        for request_id, _, start_idx, end_idx in request_batch_slices:
-            loss_fn_outputs = []
-            for i in range(start_idx, end_idx):
-                token_losses = token_losses_out[i]
-                token_logprobs = logprobs_out[i]
-                loss_fn_outputs.append({
-                    "elementwise_loss": {
-                        "data": token_losses.tolist(),
-                        "dtype": "float32",
-                        "shape": [token_losses.shape[0]],
-                    },
-                    "logprobs": {
-                        "data": token_logprobs.tolist(),
-                        "dtype": "float32",
-                        "shape": [token_logprobs.shape[0]],
-                    },
-                })
-
-            results[request_id] = types.ForwardBackwardOutput(
-                loss_fn_output_type="scalar",
-                loss_fn_outputs=loss_fn_outputs,
-                metrics={},
-            )
-
-        return results
-
     def process_forward_backward_batch(
         self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
         """Process multiple forward_backward requests in a single batch.
 
-        Args:
-            requests: Dict mapping request_id to (model_id, request_data) tuples
-
-        Returns:
-            Dict mapping request_id -> result_data or error info
+        Delegates to the backend for computation.
         """
-        # Dispatch to MaxText path if using MaxText model
-        if self.maxtext_config:
-            return self._process_forward_backward_batch_maxtext(requests)
-
-        results, valid_requests = self._filter_valid_requests(requests)
-
-        if not valid_requests:
-            return results
-
-        # Collect all examples and their metadata
-        all_input_ids = []
-        all_targets = []
-        all_token_weights = []
-        all_adapter_indices = []
-        example_model_ids = []  # map each example to its model_id
-        request_batch_slices = []  # Track which examples belong to which request
-        all_sampling_logprobs = []
-        all_advantages = []
-        all_loss_fn_types = []
-
-        for request_id, (model_id, request_data) in valid_requests.items():
-            adapter_index = self.models[model_id].adapter_index
-            loss_fn_type = LOSS_TYPES[request_data.loss_fn]
-            request_start = len(all_input_ids)
-            for item in request_data.data:
-                tokens = [t for chunk in item.model_input.chunks for t in chunk.tokens]
-                all_input_ids.append(tokens)
-                loss_fn_inputs = item.loss_fn_inputs
-                all_targets.append(loss_fn_inputs.target_tokens.data)
-                all_token_weights.append(loss_fn_inputs.weights.data)
-                all_sampling_logprobs.append(loss_fn_inputs.logprobs.data)
-                all_advantages.append(loss_fn_inputs.advantages.data)
-                all_adapter_indices.append(adapter_index)
-                example_model_ids.append(model_id)
-                all_loss_fn_types.append(loss_fn_type)
-
-            request_batch_slices.append((request_id, model_id, request_start, len(all_input_ids)))
-
-        # Return if no data to process (e.g., all requests had empty data)
-        if not all_input_ids:
-            return results
-
-        # Pad sequences to same length. Also bin it so the JIT has to compile fewer kernels.
-        max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids), self.config.min_seq_len)
-
-        input_ids = pad_batch(all_input_ids, max_len, np.int32)
-        target_ids = pad_batch(all_targets, max_len, np.int32)
-        adapter_indices = jnp.array(all_adapter_indices, dtype=jnp.int32)
-        loss_fn_types = jnp.array(all_loss_fn_types, dtype=jnp.int32)
-
-        # Create attention mask (1 for real tokens, 0 for padding)
-        attention_mask = pad_batch([[1] * len(seq) for seq in all_input_ids], max_len, np.int32)
-        loss_mask = pad_batch(all_token_weights, max_len, np.float32)
-        sampling_logprobs = pad_batch(all_sampling_logprobs, max_len, np.float32)
-        advantages = pad_batch(all_advantages, max_len, np.float32)
-
-        total_bs = int(input_ids.shape[0])
-        micro_bs = self._micro_batch_size(total_bs)
-        seq_lens = [len(seq) for seq in all_input_ids]
-
-        # Collect full padded arrays on device, slice after transfer
-        token_losses_device = []
-        logprobs_device = []
-        seq_len = input_ids.shape[1]
-
-        with jax.set_mesh(self.mesh), self._jit_timing_context(seq_len, mode="train"):
-            for mb_start in range(0, total_bs, micro_bs):
-                mb_end = min(mb_start + micro_bs, total_bs)
-                curr_input_ids = input_ids[mb_start:mb_end]
-                print(f"curr_input_ids: {curr_input_ids.shape}")
-                self.accumulated_grads, per_token_losses, target_logprobs, _ = self._forward_backward_and_accumulate(
-                    self.accumulated_grads,
-                    self.model,
-                    curr_input_ids,
-                    attention_mask[mb_start:mb_end],
-                    target_ids[mb_start:mb_end],
-                    loss_mask[mb_start:mb_end],
-                    loss_fn_types[mb_start:mb_end],
-                    sampling_logprobs[mb_start:mb_end],
-                    advantages[mb_start:mb_end],
-                )
-                print(f"per_token_losses: {per_token_losses.shape}")
-                token_losses_device.append(per_token_losses)
-                logprobs_device.append(target_logprobs)
-
-        # Single batched device-to-host transfer for all arrays
-        token_losses_host, logprobs_host = jax.device_get((token_losses_device, logprobs_device))
-
-        # Flatten microbatches and slice to actual sequence lengths
-        token_losses_out = []
-        logprobs_out = []
-        idx = 0
-        for mb_losses, mb_logprobs in zip(token_losses_host, logprobs_host):
-            for i in range(mb_losses.shape[0]):
-                token_losses_out.append(mb_losses[i, : seq_lens[idx]].astype(jnp.float32))
-                logprobs_out.append(mb_logprobs[i, : seq_lens[idx]].astype(jnp.float32))
-                idx += 1
-
-        # Compute per-request results
-        for request_id, _, start_idx, end_idx in request_batch_slices:
-            loss_fn_outputs = []
-            # Compute per-example losses
-            for i in range(start_idx, end_idx):
-                # Extract losses for this example's tokens
-                token_losses = token_losses_out[i]
-                token_logprobs = logprobs_out[i]
-                loss_fn_outputs.append(
-                    {
-                        "elementwise_loss": {
-                            "data": token_losses.tolist(),
-                            "dtype": "float32",
-                            "shape": [token_losses.shape[0]],
-                        },
-                        "logprobs": {
-                            "data": token_logprobs.tolist(),
-                            "dtype": "float32",
-                            "shape": [token_logprobs.shape[0]],
-                        },
-                    }
-                )
-
-            results[request_id] = types.ForwardBackwardOutput(
-                loss_fn_output_type="scalar",
-                loss_fn_outputs=loss_fn_outputs,
-                metrics={},
-            )
-
-        return results
+        return self.backend.process_forward_backward_batch(requests, self.models)
 
     def process_sample_batch(
         self, requests: dict[str, tuple[str, types.SampleInput]]
     ) -> dict[str, types.SampleOutput | types.ErrorResponse]:
-        """Process multiple sample requests in a single batch
+        """Process multiple sample requests in a single batch.
 
-        Args:
-            requests: Dict mapping request_id to (model_id, request_data) tuples
-
-        Returns:
-            Dict mapping request_id --> result_data or error info
+        Handles loading sampler weights from disk (file I/O), then delegates
+        computation to the backend.
         """
-        results, valid_requests = self._filter_valid_requests(requests)
+        # Load sampler weights from disk if needed (file I/O is engine responsibility)
+        self._load_sampler_weights_for_requests(requests)
 
-        if not valid_requests:
-            return results
-
-        # Computes prompt_logprobs for the whole batch if any request asked for them
-        needs_prompt_logprobs = any(request_data.prompt_logprobs for (_, request_data) in valid_requests.values())
-
-        all_prompts = []
-        all_sampling_params = []
-        all_adapter_indices = []
-        request_batch_slices = []
-
-        adapter_indices_batch = self.load_sampler_weights(valid_requests)
-
-        for i, (request_id, (model_id, request_data)) in enumerate(valid_requests.items()):
-            request_start = len(all_prompts)
-            if model_id not in self.models:
-                logger.warning(f"Model {model_id} not loaded, skipping sample request")
-                continue
-
-            # Expand requests for num_samples (TODO: Once we have continuous batching /
-            # paged attention, we should do the prefill only once and share the kv cache)
-            for _ in range(request_data.num_samples):
-                prompt_tokens = [token for chunk in request_data.prompt.chunks for token in chunk.tokens]
-                all_prompts.append(prompt_tokens)
-                all_sampling_params.append(request_data.sampling_params)
-                all_adapter_indices.append(adapter_indices_batch[i])
-
-            request_batch_slices.append((request_id, model_id, request_start, len(all_prompts), request_data))
-
-        total_batch_size = len(all_prompts)
-        max_batch_size = (
-            self.config.sample_max_num_sequences if self.config.sample_max_num_sequences > 0 else total_batch_size
-        )
-        # Collect generated sequences and prompt logprobs across batches
-        all_sequences: list[types.GeneratedSequence] = []
-        all_prompt_logprobs: list[list[float]] = []
-
-        with jax.set_mesh(self.mesh):
-            model = nnx.merge(self.graphdef, self.lora_params, self.non_lora_params)
-            for batch_start in range(0, total_batch_size, max_batch_size):
-                batch_end = min(batch_start + max_batch_size, total_batch_size)
-                batch_prompts = pad(all_prompts[batch_start:batch_end], max_batch_size, fill=[])
-                adapter_indices = pad(all_adapter_indices[batch_start:batch_end], max_batch_size, fill=0)
-                sampling_params = pad(
-                    all_sampling_params[batch_start:batch_end], max_batch_size, fill=all_sampling_params[batch_start]
-                )
-
-                # Pad sequences to same length within the batch to minimize memory usage.
-                # Also bin it so the JIT has to compile fewer kernels.
-                # Use left-padding for sampling so the last position is always the last real token.
-                max_len = round_up_seq_len(max((len(seq) for seq in batch_prompts), default=0), self.config.min_seq_len)
-                input_ids = pad_batch(batch_prompts, max_len, np.int32, left=True)
-                attention_mask = pad_batch([[1] * len(seq) for seq in batch_prompts], max_len, np.int32, left=True)
-
-                with self._jit_timing_context(max_len, mode="sample"):
-                    result = model.generate(
-                        input_ids,
-                        attention_mask,
-                        sampling_params=sampling_params,
-                        adapter_indices=jnp.array(adapter_indices, dtype=jnp.int32),
-                        prompt_logprobs=needs_prompt_logprobs,
-                    )
-                # Only take the actual results, not the padded ones
-                batch_size = batch_end - batch_start
-                all_sequences.extend(
-                    types.GeneratedSequence(stop_reason=stop_reason, tokens=tokens, logprobs=logprobs)
-                    for stop_reason, tokens, logprobs in zip(
-                        result.stop_reasons[:batch_size],
-                        result.generated_ids[:batch_size],
-                        result.logprobs[:batch_size],
-                    )
-                )
-                if needs_prompt_logprobs and result.prompt_logprobs:
-                    all_prompt_logprobs.extend(result.prompt_logprobs[:batch_size])
-
-        for request_id, _, start_idx, end_idx, request_data in request_batch_slices:
-            sequences = [all_sequences[i] for i in range(start_idx, end_idx)]
-            # Each of `num_samples` samples in a request share the same prompt; use the first's prompt logprobs
-            prompt_logprobs = (
-                all_prompt_logprobs[start_idx] if request_data.prompt_logprobs and all_prompt_logprobs else None
-            )
-            results[request_id] = types.SampleOutput(sequences=sequences, prompt_logprobs=prompt_logprobs)
-
-        return results
+        # Delegate computation to backend
+        return self.backend.process_sample_batch(requests, self.models)
 
     def process_optim_step(self, model_id: str, request_data: types.OptimStepInput) -> types.OptimStepOutput:
-        """Process an optim_step request and apply accumulated gradients."""
-        # Check if we have any gradients accumulated (count > 0)
-        if self.accumulated_grads.count[0] == 0:
-            logger.warning(f"No accumulated gradients for model {model_id}, skipping optimizer step")
-            return types.OptimStepOutput()
+        """Process an optim_step request and apply accumulated gradients.
+
+        Delegates to the backend for computation.
+        """
         if model_id not in self.models:
             logger.warning(f"Model {model_id} not loaded, skipping optimizer step")
             return types.OptimStepOutput()
 
-        if self.maxtext_config:
-            # === MaxText path: use maxtext_optimizer (like train_maxtext.py) ===
-            from flax.linen import partitioning as nn_partitioning
-
-            # Update hyperparameters from the request
-            hp = self.maxtext_optimizer.opt_state.hyperparams
-            hp["learning_rate"][...] = request_data.adam_params.learning_rate
-            hp["b1"][...] = request_data.adam_params.beta1
-            hp["b2"][...] = request_data.adam_params.beta2
-            hp["eps"][...] = request_data.adam_params.eps
-
-            # Get mean gradients and apply optimizer step
-            mean_grads = self.accumulated_grads.get_mean()
-
-            with jax.set_mesh(self.mesh), nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
-                self._optim_step_maxtext(self.model, self.maxtext_optimizer, mean_grads)
-
-            # Reset accumulated gradients
-            self.accumulated_grads = self.accumulated_grads.reset()
-
-            logger.info(f"Applied MaxText optimizer step for model {model_id}")
-        else:
-            # === Qwen3 + LoRA path ===
-            if model_id not in self.models:
-                raise ValueError(f"Model {model_id} not loaded")
-
-            adapter_index = jnp.int32(self.models[model_id].adapter_index)
-
-            # Update hyperparameters from the request
-            hp = self.optimizers[model_id].opt_state.hyperparams
-            hp["learning_rate"][...] = request_data.adam_params.learning_rate
-            hp["b1"][...] = request_data.adam_params.beta1
-            hp["b2"][...] = request_data.adam_params.beta2
-            hp["eps"][...] = request_data.adam_params.eps
-
-            # JIT-compiled: compute full gradients, apply optimizer update, and reset accumulated grads
-            with jax.set_mesh(self.mesh):
-                self.accumulated_grads = self._compute_grads_and_update(
-                    self.accumulated_grads,
-                    self.lora_params,
-                    self.optimizers[model_id],
-                    adapter_index,
-                )
-
-            logger.info(f"Applied optimizer step for model {model_id} (adapter {adapter_index})")
-
-        return types.OptimStepOutput()
+        adapter_index = self.models[model_id].adapter_index
+        return self.backend.process_optim_step(
+            model_id, request_data, self.optimizers[model_id], adapter_index
+        )
 
     def process_load_weights(self, model_id: str, request_data: types.LoadWeightsInput) -> types.LoadWeightsOutput:
-        """Loads a clean, trimmed training checkpoint."""
+        """Loads a clean, trimmed training checkpoint.
+
+        Handles file I/O (download), delegates state insertion to backend.
+        """
         if model_id not in self.models:
             raise ValueError("Model not loaded. Create the model before loading a checkpoint.")
 
-        adapter_index = self.models[model_id].adapter_index
         checkpoint_dir = (
             self.config.checkpoints_base / request_data.source_model_id / f"{request_data.checkpoint_id}.tar.gz"
         )
 
+        # Download and extract checkpoint (file I/O)
         with download_and_unpack(checkpoint_dir) as temp_dir:
+            # Get empty checkpoint structure from backend for restoration target
+            checkpoint_data = self.backend.extract_checkpoint_data(model_id, self.models, self.optimizers)
             checkpoint = checkpoints.restore_checkpoint(
-                ckpt_dir=temp_dir, target=self._extract_checkpoint_data(model_id), prefix="checkpoint_"
+                ckpt_dir=temp_dir, target=checkpoint_data, prefix="checkpoint_"
             )
 
         if checkpoint is None:
             raise FileNotFoundError(f"Training checkpoint not found in {checkpoint_dir}")
 
-        # Validate rank
-        rank = checkpoint["lora_config"]["rank"]
-        if self.models[model_id].lora_config.rank != rank:
-            raise ValueError(
-                f"Rank mismatch: checkpoint has rank {rank}, model configured with rank {self.models[model_id].lora_config.rank}"
-            )
-
-        # Update both LoRA weights and optimizer state
-        insert_adapter_state(adapter_index, self.lora_params, checkpoint["lora_weights"], rank)
-        insert_adapter_state(adapter_index, nnx.state(self.optimizers[model_id]), checkpoint["optimizer_state"], rank)
+        # Delegate state insertion to backend
+        self.backend.insert_checkpoint_data(model_id, checkpoint, self.models, self.optimizers)
 
         logger.info(f"Loaded training checkpoint for model {model_id} from {checkpoint_dir}")
         return types.LoadWeightsOutput(type="load_weights")
 
     def process_save_weights(self, model_id: str, request_data: types.SaveWeightsInput) -> types.SaveWeightsOutput:
-        """
-        Saves a clean training checkpoint by converting the trimmed NNX graph
-        to a pure dictionary before serialization, following official Flax docs.
+        """Saves a clean training checkpoint.
 
-        For MaxText path: saves in HuggingFace PEFT format using convert_maxtext_lora_to_hf.
-        For LoRA path: saves using Flax checkpoints format.
+        Handles file I/O (upload), delegates state extraction to backend.
+        For MaxText: saves in HuggingFace PEFT format.
+        For Native: saves using Flax checkpoints format.
         """
         if model_id not in self.models:
             raise ValueError(f"Model {model_id} not loaded")
@@ -1261,16 +282,17 @@ class TinkerEngine:
         checkpoint_id = request_data.path
 
         if self.maxtext_config:
-            # === MaxText path: save in HuggingFace PEFT format ===
+            # MaxText path: save in HuggingFace PEFT format
             output_path = self.config.checkpoints_base / model_id / checkpoint_id
 
             with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
+                checkpoint_data = self.backend.extract_checkpoint_data(model_id, self.models, self.optimizers)
                 convert_maxtext_lora_to_hf(
-                    lora_state=self.lora_params,
+                    lora_state=checkpoint_data["lora_params"],
                     output_path=output_path,
                     base_model_name=self.config.base_model,
-                    lora_rank=self.maxtext_config.lora_rank,
-                    lora_alpha=self.maxtext_config.lora_alpha,
+                    lora_rank=checkpoint_data["lora_rank"],
+                    lora_alpha=checkpoint_data["lora_alpha"],
                 )
                 logger.info(f"Saved MaxText LoRA checkpoint in HF format for model {model_id} to {output_path}")
 
@@ -1279,13 +301,14 @@ class TinkerEngine:
                 type="save_weights",
             )
         else:
-            # === LoRA path: save using Flax checkpoints ===
+            # Native path: save using Flax checkpoints
             output_path = self.config.checkpoints_base / model_id / f"{checkpoint_id}.tar.gz"
 
             with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
                 with pack_and_upload(output_path) as temp_dir:
+                    checkpoint_data = self.backend.extract_checkpoint_data(model_id, self.models, self.optimizers)
                     checkpoints.save_checkpoint(
-                        target=self._extract_checkpoint_data(model_id),
+                        target=checkpoint_data,
                         ckpt_dir=temp_dir,
                         step=0,
                         prefix="checkpoint_",
@@ -1302,7 +325,10 @@ class TinkerEngine:
     def process_save_weights_for_sampler(
         self, model_id: str, request_data: types.SaveWeightsForSamplerInput
     ) -> types.SaveWeightsForSamplerOutput:
-        """Process a save_weights_for_sampler request and save model weights."""
+        """Save model weights for sampler checkpoint.
+
+        Handles file I/O (upload), delegates state extraction to backend.
+        """
         if model_id not in self.models:
             raise ValueError(f"Model {model_id} not loaded")
 
@@ -1312,28 +338,35 @@ class TinkerEngine:
         checkpoint_id = Path(request_data.path).name
 
         if self.maxtext_config:
-            # === MaxText path: save in HuggingFace PEFT format ===
+            # MaxText path: save in HuggingFace PEFT format
             output_path = self.config.checkpoints_base / model_id / "sampler_weights" / checkpoint_id
 
             with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
+                checkpoint_data = self.backend.extract_sampler_weights(model_id, self.models)
                 convert_maxtext_lora_to_hf(
-                    lora_state=self.lora_params,
+                    lora_state=checkpoint_data["lora_params"],
                     output_path=output_path,
                     base_model_name=self.config.base_model,
-                    lora_rank=self.maxtext_config.lora_rank,
-                    lora_alpha=self.maxtext_config.lora_alpha,
+                    lora_rank=checkpoint_data["lora_rank"],
+                    lora_alpha=checkpoint_data["lora_alpha"],
                 )
                 logger.info(
                     f"Saved MaxText LoRA sampler checkpoint in HF format for model {model_id} to {output_path}"
                 )
         else:
-            # === LoRA path: save using save_lora_checkpoint ===
+            # Native path: save using save_lora_checkpoint
             output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
 
             with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
+                # Get weights data from backend
+                weights_data = self.backend.extract_sampler_weights(model_id, self.models)
                 # Save the LoRA adapter weights and LoRA config as tar.gz
                 save_lora_checkpoint(
-                    self.model, self.config.base_model, lora_model.lora_config, lora_model.adapter_index, output_path
+                    weights_data["model"],
+                    weights_data["base_model"],
+                    weights_data["lora_config"],
+                    weights_data["adapter_index"],
+                    output_path
                 )
 
                 logger.info(
@@ -1345,53 +378,37 @@ class TinkerEngine:
             type="save_weights_for_sampler",
         )
 
-    def load_sampler_weights(self, requests: dict[str, tuple[str, types.SampleInput]]) -> list[int]:
-        """Load sampler weights for all requests and return full adapter indices array.
+    def _load_sampler_weights_for_requests(self, requests: dict[str, tuple[str, types.SampleInput]]) -> None:
+        """Load sampler weights from disk for requests that need them.
+
+        This is the file I/O portion - delegates state insertion to the backend.
 
         Args:
             requests: Dict mapping request_id to (model_id, request_data) tuples for the batch
-
-        Returns:
-            The adapter_indices array for LoRA sampling [batch_size]
-            Uses adapter index 0 for base model sampling (no LoRA)
         """
-        adapter_indices = []
-
         for _, (model_id, request_data) in requests.items():
             base_model = request_data.base_model
             checkpoint_id = request_data.checkpoint_id
+
             if base_model is None:
                 # This code path is for sampling from a LoRA adapter
                 assert checkpoint_id != "", "checkpoint_id must be not empty"
 
-                adapter_index = self.models[model_id].adapter_index
-                if self.models[model_id].loaded_checkpoint_id == checkpoint_id:
-                    # Load model from RAM
-                    adapter_indices.append(adapter_index)
-                else:
-                    # Load model from disk
-                    assert adapter_index not in adapter_indices, "Cannot override already used adapter"
-
+                if self.models[model_id].loaded_checkpoint_id != checkpoint_id:
+                    # Load model from disk and insert into backend state
                     checkpoint_path = (
                         self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
                     )
                     logger.info(f"Loading LoRA sampler checkpoint from {checkpoint_path}")
-                    adapter_config = self.models[model_id].lora_config
-                    load_lora_checkpoint(self.model, adapter_config, adapter_index, checkpoint_path)
-
-                    self.models[model_id].loaded_checkpoint_id = checkpoint_id
-                    logger.info(f"Loaded LoRA sampler weights for model {model_id} at adapter index {adapter_index}")
-                    adapter_indices.append(adapter_index)
+                    self.backend.insert_sampler_weights(
+                        model_id, checkpoint_id, checkpoint_path, self.models
+                    )
             else:
                 # This code path is for sampling from the base model
                 if base_model != self.config.base_model:
                     raise ValueError(
                         f"Requested base_model '{base_model}' does not match engine's base_model '{self.config.base_model}'"
                     )
-                assert model_id == "" and checkpoint_id == ""
-                adapter_indices.append(0)
-
-        return adapter_indices
 
     def _complete_futures(self, results: dict[str, BaseModel]):
         """Helper method to complete multiple futures in the database.

@@ -43,6 +43,10 @@ while [[ $# -gt 0 ]]; do
             MIN_SEQ_LEN="$2"
             shift 2
             ;;
+        --train-micro-batch-size)
+            TRAIN_MICRO_BATCH_SIZE="$2"
+            shift 2
+            ;;
         --no-load-safetensors)
             ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --no-load-safetensors"
             shift
@@ -98,15 +102,18 @@ ts "Log file: ${LOG_FILE}"
 sudo chown -R $(whoami) /dev/shm/huggingface_cache
 # Date-based checkpoint path
 DATE=$(date +%Y%m%d)
-CHECKPOINTS_BASE="/dev/shm/huggingface_cache/lora-experiments/qwen3-4b/${DATE}"
-EXTERNAL_LORA_BASE="gs://ohadrubin-docker-images/lora-experiments/qwen3-4b/${DATE}"
+CHECKPOINTS_BASE="/dev/shm/gcs_bucket_mount/lora-experiments/${DATE}"
+EXTERNAL_LORA_BASE="/dev/shm/gcs_bucket_mount/lora-experiments/${DATE}"
+
+
+
 export USE_NNX_VALUE_AND_GRAD=1
 # Model configurationor
 BASE_MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507"
 TENSOR_PARALLEL_SIZE=8
 MAX_LORA_ADAPTERS=4
 MAX_LORA_RANK=8
-TRAIN_MICRO_BATCH_SIZE=1
+TRAIN_MICRO_BATCH_SIZE=${TRAIN_MICRO_BATCH_SIZE:-1}  # Use CLI value or default to 1
 # Disable algebraic simplification to prevent OOM during compilation
 
 
@@ -126,9 +133,9 @@ sleep 2
 ts "Reinstalling ringattention"
 # Reinstall ringattention to get clean copy, then fix deprecated JAX API
 # uv pip install --reinstall ringattention --quiet
-# rm -f uv.lock  # Remove lockfile to ensure local flax is used
+rm -f uv.lock  # Remove lockfile to ensure local flax is used
 # uv sync --extra tpu --extra tinker
-# uv pip install -e ~/maxtext --reinstall  # Install maxtext as editable so rsync changes take effect
+uv pip install -e ~/maxtext --reinstall  # Install maxtext as editable so rsync changes take effect
 # uv pip install -e ~/flax --reinstall  # Install flax as editable so rsync changes take effect
 # RING_INIT="/home/ohadr/SkyRL/skyrl-tx/.venv${PYTHON_VERSION}/lib/python${PYTHON_VERSION}/site-packages/ringattention/__init__.py"
 # sed -i 's/jax.lib.xla_bridge.get_backend/jax.extend.backend.get_backend/' "$RING_INIT"
@@ -138,7 +145,8 @@ ADDITIONAL_FLAGS="${ADDITIONAL_FLAGS} --shard-attention-heads"
 # Run the server
 # --gradient-checkpointing \
 # Build command with optional maxtext config
-CMD=(uv run  --extra tinker --extra tpu --reinstall-package flax --reinstall-package maxtext --refresh-package flax --refresh-package maxtext -m tx.tinker.api
+# CMD=(uv run  --extra tinker --extra tpu --reinstall-package flax --reinstall-package maxtext --refresh-package flax --refresh-package maxtext -m tx.tinker.api
+CMD=(uv run --no-sync --extra tinker --extra tpu -m tx.tinker.api
     --checkpoints-base "${CHECKPOINTS_BASE}"
     ${ADDITIONAL_FLAGS}
     --base-model "${BASE_MODEL}"
