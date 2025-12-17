@@ -1,3 +1,5 @@
+import shutil
+
 import httpx
 from datetime import datetime, timezone
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -66,10 +68,9 @@ class ExternalInferenceClient:
         if not target_dir.exists():
             try:
                 with download_and_unpack(checkpoint_path) as extracted_path:
-                    extracted_path.rename(target_dir)
+                    shutil.move(str(extracted_path), str(target_dir))
             except FileExistsError:
-                # This could happen if two processes try to download the file.
-                # In that case the other process won the race and created target_dir.
+                # Race condition: another process created target_dir
                 pass
 
         payload = {
