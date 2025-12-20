@@ -25,11 +25,18 @@ class ExternalInferenceClient:
     """Client for calling external inference engines (e.g., vLLM)."""
 
     def __init__(self, engine_config: EngineConfig, db_engine):
-        self.base_url = f"{engine_config.external_inference_url}/v1"
+        self.base_urls = [f"{url}/v1" for url in engine_config.external_inference_urls]
+        self._url_index = 0
         self.api_key = engine_config.external_inference_api_key
         self.checkpoints_base = engine_config.checkpoints_base
         self.lora_base_dir = engine_config.external_inference_lora_base
         self.db_engine = db_engine
+
+    def _get_next_url(self) -> str:
+        """Round-robin server selection."""
+        url = self.base_urls[self._url_index % len(self.base_urls)]
+        self._url_index += 1
+        return url
 
     async def call_and_store_result(
         self,
@@ -38,19 +45,39 @@ class ExternalInferenceClient:
         model_id: str,
         checkpoint_id: str,
     ):
-        """Background task to call external engine and store result in database."""
-        try:
-            async with httpx.AsyncClient(
-                base_url=self.base_url,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=httpx.Timeout(600.0, connect=10.0),  # 10 minutes for inference, 10s for connect
-            ) as http_client:
-                result = await self._forward_to_engine(sample_req, model_id, checkpoint_id, http_client)
-            result_data = result.model_dump()
-            status = RequestStatus.COMPLETED
-        except Exception as e:
-            logger.exception("External engine error")
-            result_data = {"error": str(e), "status": "failed"}
+        """Background task to call external engine and store result in database.
+
+        Tries servers in round-robin order, falling back to next server on connection failures.
+        """
+        last_error = None
+
+        for _ in range(len(self.base_urls)):
+            base_url = self._get_next_url()
+            try:
+                async with httpx.AsyncClient(
+                    base_url=base_url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=httpx.Timeout(600.0, connect=10.0),  # 10 minutes for inference, 10s for connect
+                ) as http_client:
+                    result = await self._forward_to_engine(sample_req, model_id, checkpoint_id, http_client)
+                result_data = result.model_dump()
+                status = RequestStatus.COMPLETED
+                break
+            except (httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                # Connection-level failure - try next server
+                logger.warning(f"Server {base_url} failed with connection error, trying next: {e}")
+                last_error = e
+                continue
+            except Exception as e:
+                # Non-connection error (e.g., HTTP 4xx, inference error) - don't retry on other servers
+                logger.exception(f"External engine error on {base_url}")
+                result_data = {"error": str(e), "status": "failed"}
+                status = RequestStatus.FAILED
+                break
+        else:
+            # All servers failed with connection errors
+            logger.exception(f"All {len(self.base_urls)} external engines failed")
+            result_data = {"error": str(last_error), "status": "failed"}
             status = RequestStatus.FAILED
 
         async with AsyncSession(self.db_engine) as session:

@@ -50,9 +50,9 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(SQLModel.metadata.create_all)
 
     # Setup external inference client if configured
-    if app.state.engine_config.external_inference_url:
+    if app.state.engine_config.external_inference_urls:
         app.state.external_inference_client = ExternalInferenceClient(app.state.engine_config, app.state.db_engine)
-        logger.info(f"External engine configured: {app.state.engine_config.external_inference_url}")
+        logger.info(f"External engines configured: {app.state.engine_config.external_inference_urls}")
     else:
         app.state.external_inference_client = None
         logger.info("Using internal engine for inference")

@@ -41,10 +41,10 @@ class EngineConfig(BaseModel):
         default=False,
         description="Whether to use gradient checkpointing (full recomputation strategy)",
     )
-    external_inference_url: str | None = Field(
-        default=None,
-        description="URL of the external inference engine. If set, sample requests will be sent to the external engine instead (currently only VLLM is supported).",
-        json_schema_extra={"argparse_type": str},
+    external_inference_urls: list[str] = Field(
+        default_factory=list,
+        description="URLs of external inference engines (comma-separated). If set, sample requests will be round-robin distributed across servers (currently only VLLM is supported).",
+        json_schema_extra={"argparse_type": lambda s: [url.strip() for url in s.split(",") if url.strip()]},
     )
     external_inference_api_key: str = Field(
         default="EMPTY",
