@@ -567,8 +567,10 @@ class TinkerEngine:
             )
 
         return types.SaveWeightsForSamplerOutput(
-            path=f"tinker://{model_id}/{checkpoint_id}",
+            path=None,  # Newer clients expect None (they track path internally)
+            # path=f"tinker://{model_id}/{checkpoint_id}",
             type="save_weights_for_sampler",
+            sampling_session_id=request_data.sampling_session_id,
         )
 
     def load_sampler_weights(self, requests: dict[str, tuple[str, types.SampleInput]]) -> list[int]:

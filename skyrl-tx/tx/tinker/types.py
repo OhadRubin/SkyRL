@@ -129,11 +129,13 @@ class OptimStepOutput(BaseModel):
 
 class SaveWeightsForSamplerInput(BaseModel):
     path: str
+    sampling_session_id: str | None = None  # Created by API, passed through to output
 
 
 class SaveWeightsForSamplerOutput(BaseModel):
-    path: str
+    path: str | None = None  # Newer clients expect None (they track path internally)
     type: str
+    sampling_session_id: str | None = None  # Newer clients use this to create SamplingClient
 
 
 class SaveWeightsInput(BaseModel):

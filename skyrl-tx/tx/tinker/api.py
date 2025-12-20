@@ -360,7 +360,20 @@ class OptimStepRequest(BaseModel):
 
 class SaveWeightsForSamplerRequest(BaseModel):
     model_id: str
-    path: str = Field(..., pattern=ID_PATTERN, max_length=ID_MAX_LENGTH)
+    path: str | None = Field(default=None, pattern=ID_PATTERN, max_length=ID_MAX_LENGTH)
+    # Fields sent by newer tinker client versions
+    sampling_session_seq_id: int | None = None
+    seq_id: int | None = None
+
+    @model_validator(mode="after")
+    def compute_path(self) -> "SaveWeightsForSamplerRequest":
+        """Compute path from sampling_session_seq_id and seq_id if not provided."""
+        if self.path is None:
+            if self.sampling_session_seq_id is not None and self.seq_id is not None:
+                self.path = f"sampler_{self.sampling_session_seq_id}_{self.seq_id}"
+            else:
+                raise ValueError("Either 'path' or both 'sampling_session_seq_id' and 'seq_id' must be provided")
+        return self
 
 
 class SamplingParams(BaseModel):
@@ -788,11 +801,26 @@ async def save_weights_for_sampler(
         checkpoint_type=types.CheckpointType.SAMPLER,
     )
 
+    # Get model info for base_model
+    model = await get_model(session, request.model_id)
+
+    # Create sampling session so client can use sampling_session_id for sample requests
+    sampling_session_id = f"sampling_{uuid4().hex[:8]}"
+    model_path = f"tinker://{request.model_id}/{request.path}"
+    sampling_db = SamplingSessionDB(
+        sampling_session_id=sampling_session_id,
+        session_id=None,  # No session association for ephemeral sampling sessions
+        sampling_session_seq_id=request.sampling_session_seq_id,
+        base_model=None,  # Don't set base_model when using model_path (LoRA checkpoint)
+        model_path=model_path,
+    )
+    session.add(sampling_db)
+
     request_id = await create_future(
         session=session,
         request_type=types.RequestType.SAVE_WEIGHTS_FOR_SAMPLER,
         model_id=request.model_id,
-        request_data=types.SaveWeightsForSamplerInput(path=request.path),
+        request_data=types.SaveWeightsForSamplerInput(path=request.path, sampling_session_id=sampling_session_id),
     )
 
     await session.commit()

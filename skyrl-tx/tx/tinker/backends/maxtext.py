@@ -364,6 +364,22 @@ class MaxTextBackend(AbstractBackend):
 
         batch_size = input_ids.shape[0]
         seq_len = input_ids.shape[1]
+
+        # Pad batch to be divisible by FSDP size for sharding compatibility
+        fsdp_size = self.mesh.shape['fsdp']
+        original_batch_size = batch_size
+        if batch_size % fsdp_size != 0:
+            padded_batch_size = ((batch_size + fsdp_size - 1) // fsdp_size) * fsdp_size
+            pad_size = padded_batch_size - batch_size
+            input_ids = np.pad(input_ids, ((0, pad_size), (0, 0)), mode='constant', constant_values=0)
+            target_ids = np.pad(target_ids, ((0, pad_size), (0, 0)), mode='constant', constant_values=0)
+            loss_mask = np.pad(loss_mask, ((0, pad_size), (0, 0)), mode='constant', constant_values=0)
+            sampling_logprobs = np.pad(sampling_logprobs, ((0, pad_size), (0, 0)), mode='constant', constant_values=0)
+            advantages = np.pad(advantages, ((0, pad_size), (0, 0)), mode='constant', constant_values=0)
+            loss_fn_types = jnp.pad(loss_fn_types, (0, pad_size), mode='constant', constant_values=0)
+            batch_size = padded_batch_size
+            logger.info(f"Padded batch from {original_batch_size} to {padded_batch_size} for FSDP sharding")
+
         positions = jnp.broadcast_to(jnp.arange(seq_len), (batch_size, seq_len))
         seq_lens = [len(seq) for seq in all_input_ids]
 
@@ -419,9 +435,13 @@ class MaxTextBackend(AbstractBackend):
         idx = 0
         for mb_losses, mb_logprobs in zip(token_losses_host, logprobs_host):
             for i in range(mb_losses.shape[0]):
+                if idx >= original_batch_size:
+                    break  # Skip padded samples
                 token_losses_out.append(mb_losses[i, :seq_lens[idx]].astype(jnp.float32))
                 logprobs_out.append(mb_logprobs[i, :seq_lens[idx]].astype(jnp.float32))
                 idx += 1
+            if idx >= original_batch_size:
+                break
 
         for request_id, _, start_idx, end_idx in request_batch_slices:
             loss_fn_outputs = []
