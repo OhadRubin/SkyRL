@@ -111,7 +111,8 @@ class NativeBackend(AbstractBackend):
 
         # Create model and load weights
         self.mesh = jax.make_mesh((1, config.tensor_parallel_size), ("dp", "tp"))
-        with jax.set_mesh(self.mesh):
+        
+        with jax.set_mesh(self.mesh), nnx.use_eager_sharding(True):
             self.model = model_class(
                 self.model_config, dtype=get_dtype(self.model_config.dtype), rngs=nnx.Rngs(0)
             )
@@ -129,6 +130,9 @@ class NativeBackend(AbstractBackend):
             self.accumulated_grads = AccumulatedGradients.create(
                 self.lora_params, config.max_lora_adapters
             )
+
+        # Per-model optimizer storage (managed internally)
+        self.optimizers: dict[str, nnx.Optimizer] = {}
 
         logger.info(
             f"Initialized base model {config.base_model} with "
@@ -223,7 +227,7 @@ class NativeBackend(AbstractBackend):
                 advantages,
             )
 
-            per_seq_loss = per_token_losses.sum(axis=-1) / loss_mask.sum(axis=-1)
+            per_seq_loss = per_token_losses.sum(axis=-1) / jnp.maximum(loss_mask.sum(axis=-1), 1e-9)
             # Return sum of losses (we'll divide gradients by per-adapter batch size later)
             return per_seq_loss.sum(), (target_logprobs, per_token_losses)
 
@@ -337,16 +341,37 @@ class NativeBackend(AbstractBackend):
         else:
             self._compute_grads_and_update = nnx.jit(compute_grads_and_update)
 
-    def create_optimizer(self, model_id: str) -> nnx.Optimizer:
-        """Create an optimizer for a model."""
-        with jax.set_mesh(self.mesh):
-            # These values are always overridden by the hyperparams in the optim_step request.
-            tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.0)
-            return nnx.Optimizer(self.model, tx, wrt=self.model.is_lora_param)
+    def register_model(self, model_id: str, adapter_index: int, lora_config: types.LoraConfig) -> None:
+        """Register a new model with the backend.
 
-    def configure_adapter(self, adapter_index: int, lora_config: types.LoraConfig) -> None:
-        """Configure LoRA adapter rank and scaling in all LoRA layers."""
+        Creates optimizer and configures LoRA adapter.
+        """
+        # Create optimizer
+        with jax.set_mesh(self.mesh):
+            tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.0)
+            self.optimizers[model_id] = nnx.Optimizer(self.model, tx, wrt=self.model.is_lora_param)
+
+        # Configure adapter
         update_adapter_config(self.model, adapter_index, lora_config)
+        logger.info(f"Registered model {model_id} with adapter_index={adapter_index}")
+
+    def unregister_model(self, model_id: str, adapter_index: int) -> None:
+        """Unregister a model from the backend.
+
+        Removes optimizer and resets adapter weights.
+        """
+        # Remove optimizer
+        self.optimizers.pop(model_id, None)
+
+        # Zero out adapter weights
+        def zero_adapter_slice(path: tuple, p: jnp.ndarray) -> jnp.ndarray:
+            if len(path) >= 2 and path[-2].key in {"lora_A", "lora_B"}:
+                return p.at[adapter_index].set(0.0)
+            return p
+
+        updated_params = jax.tree.map_with_path(zero_adapter_slice, self.lora_params)
+        nnx.update(self.lora_params, updated_params)
+        logger.info(f"Unregistered model {model_id} (adapter_index={adapter_index})")
 
     def _process_model_pass_batch(
         self,
@@ -378,7 +403,7 @@ class NativeBackend(AbstractBackend):
         request_batch_slices = prepared_batch.request_batch_slices
 
         # Pad sequences to same length. Also bin it so the JIT has to compile fewer kernels.
-        max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids))
+        max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids), self.config.min_seq_len)
 
         input_ids = pad_batch(all_input_ids, max_len, np.int32)
         target_ids = pad_batch(all_targets, max_len, np.int32)
@@ -480,12 +505,12 @@ class NativeBackend(AbstractBackend):
     def process_optim_step(
         self,
         model_id: str,
-        request_data: types.OptimStepInput,
-        optimizer: nnx.Optimizer,
         adapter_index: int,
+        request_data: types.OptimStepInput,
     ) -> types.OptimStepOutput:
         """Process an optim_step request and apply accumulated gradients."""
         adapter_index_arr = jnp.int32(adapter_index)
+        optimizer = self.optimizers[model_id]
 
         # Check if we have any gradients accumulated (count > 0)
         if self.accumulated_grads.counts[adapter_index] == 0:
@@ -556,7 +581,7 @@ class NativeBackend(AbstractBackend):
                 # Pad sequences to same length within the batch to minimize memory usage.
                 # Also bin it so the JIT has to compile fewer kernels.
                 # Use left-padding for sampling so the last position is always the last real token.
-                max_len = round_up_seq_len(max((len(seq) for seq in batch_prompts), default=0))
+                max_len = round_up_seq_len(max((len(seq) for seq in batch_prompts), default=0), self.config.min_seq_len)
                 input_ids = pad_batch(batch_prompts, max_len, np.int32, left=True)
                 attention_mask = pad_batch([[1] * len(seq) for seq in batch_prompts], max_len, np.int32, left=True)
 
@@ -597,11 +622,10 @@ class NativeBackend(AbstractBackend):
         output_path,
         model_id: str,
         models: dict[str, types.ModelMetadata],
-        optimizers: dict[str, nnx.Optimizer],
     ) -> None:
         """Save training checkpoint as tar.gz using Flax checkpoints."""
         with pack_and_upload(output_path) as temp_dir:
-            checkpoint_data = self.extract_checkpoint_data(model_id, models, optimizers)
+            checkpoint_data = self.extract_checkpoint_data(model_id, models)
             checkpoints.save_checkpoint(
                 target=checkpoint_data,
                 ckpt_dir=temp_dir,
@@ -615,13 +639,12 @@ class NativeBackend(AbstractBackend):
         self,
         model_id: str,
         models: dict[str, types.ModelMetadata],
-        optimizers: dict[str, nnx.Optimizer],
     ) -> dict:
         """Extract adapter state and optimizer state for checkpointing."""
         adapter_index = models[model_id].adapter_index
         rank = models[model_id].lora_config.rank
         lora_weights = extract_adapter_state(adapter_index, self.lora_params, rank)
-        optimizer_state = extract_adapter_state(adapter_index, nnx.state(optimizers[model_id]), rank)
+        optimizer_state = extract_adapter_state(adapter_index, nnx.state(self.optimizers[model_id]), rank)
         return {
             "lora_weights": lora_weights,
             "optimizer_state": optimizer_state,
@@ -633,7 +656,6 @@ class NativeBackend(AbstractBackend):
         model_id: str,
         checkpoint_data: dict,
         models: dict[str, types.ModelMetadata],
-        optimizers: dict[str, nnx.Optimizer],
     ) -> None:
         """Insert checkpoint data into model state."""
         adapter_index = models[model_id].adapter_index
@@ -646,7 +668,7 @@ class NativeBackend(AbstractBackend):
             )
 
         insert_adapter_state(adapter_index, self.lora_params, checkpoint_data["lora_weights"], rank)
-        insert_adapter_state(adapter_index, nnx.state(optimizers[model_id]), checkpoint_data["optimizer_state"], rank)
+        insert_adapter_state(adapter_index, nnx.state(self.optimizers[model_id]), checkpoint_data["optimizer_state"], rank)
 
     def save_sampler_checkpoint(
         self,

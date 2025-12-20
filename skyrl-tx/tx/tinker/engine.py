@@ -15,7 +15,7 @@ from flax.training import checkpoints
 from tx.tinker.db_models import FutureDB, RequestStatus, CheckpointDB, CheckpointStatus
 from tx.tinker import types
 from tx.tinker.config import EngineConfig, add_model
-from tx.tinker.backends import NativeBackend
+from tx.tinker.backends import NativeBackend, MaxTextBackend, parse_maxtext_config
 from tx.tinker.backends.utils import log_timing
 from tx.tinker.loss_fns import LOSS_TYPES
 from tx.utils.storage import download_and_unpack
@@ -32,7 +32,7 @@ class TinkerEngine:
     - Storing models and optimizers dicts
     - Validating requests against loaded models
 
-    Computation is delegated to the backend (NativeBackend).
+    Computation is delegated to the backend (NativeBackend or MaxTextBackend).
     """
 
     def _filter_valid_requests(
@@ -169,11 +169,16 @@ class TinkerEngine:
 
         # Store LoRA model metadata (model_id -> metadata)
         self.models: dict[str, types.ModelMetadata] = {}
-        # Store optimizer instances per LoRA adapter (model_id -> optimizer)
-        self.optimizers: dict[str, nnx.Optimizer] = {}
+        # Cache for evicted model states (model_id -> checkpoint_data)
+        # Allows restoring weights when same model_id is recreated
+        self._model_cache: dict[str, dict] = {}
 
         # Initialize the backend (handles model state and computation)
-        self.backend = NativeBackend(config)
+        if config.maxtext_config_str:
+            maxtext_config = parse_maxtext_config(config.maxtext_config_str)
+            self.backend = MaxTextBackend(config, maxtext_config)
+        else:
+            self.backend = NativeBackend(config)
 
         logger.info(
             f"Initialized TinkerEngine with backend={type(self.backend).__name__}, "
@@ -184,6 +189,50 @@ class TinkerEngine:
     def metrics(self) -> types.EngineMetrics:
         """Pass-through to backend metrics for backwards compatibility."""
         return self.backend.metrics
+
+    def _find_lru_model(self) -> str | None:
+        """Find the least recently used model.
+
+        Returns:
+            model_id of the LRU model, or None if no models exist
+        """
+        if not self.models:
+            return None
+
+        # Find model with oldest last_used timestamp (None treated as oldest)
+        lru_model_id = min(
+            self.models.keys(),
+            key=lambda mid: self.models[mid].last_used or 0.0
+        )
+        return lru_model_id
+
+    def _evict_model(self, model_id: str) -> int:
+        """Evict a model and return its adapter index for reuse.
+
+        Caches the model's LoRA weights and optimizer state before eviction,
+        allowing restoration if the same model_id is created again.
+
+        Args:
+            model_id: The model to evict
+
+        Returns:
+            The adapter_index that was freed up
+        """
+        # Cache the model state before evicting (for potential restoration)
+        if model_id in self.models:
+            cached_state = self.backend.extract_checkpoint_data(model_id, self.models)
+            self._model_cache[model_id] = cached_state
+            logger.info(f"Cached state for model {model_id}")
+
+        metadata = self.models.pop(model_id)
+        self.backend.unregister_model(model_id, metadata.adapter_index)
+        logger.info(f"Evicted model {model_id} (adapter_index={metadata.adapter_index}) to make room for new model")
+        return metadata.adapter_index
+
+    def _touch_model(self, model_id: str) -> None:
+        """Update last_used timestamp for a model."""
+        if model_id in self.models:
+            self.models[model_id].last_used = time.time()
 
     @contextmanager
     def _checkpoint_status_context(self, model_id: str, checkpoint_id: str, checkpoint_type: types.CheckpointType):
@@ -317,12 +366,6 @@ class TinkerEngine:
 
     def process_create_model(self, model_id: str, request_data: types.CreateModelInput) -> types.CreateModelOutput:
         """Create and initialize a model."""
-        # Assign adapter index for this model_id
-        adapter_index = max((m.adapter_index for m in self.models.values()), default=0) + 1
-
-        if adapter_index >= self.config.max_lora_adapters:
-            raise ValueError(f"Maximum number of LoRA adapters ({self.config.max_lora_adapters}) reached")
-
         # Extract LoRA configuration
         lora_config = request_data.lora_config
 
@@ -330,16 +373,36 @@ class TinkerEngine:
         if not (0 < lora_config.rank <= self.config.max_lora_rank):
             raise ValueError(f"LoRA rank {lora_config.rank} must be between 1 and {self.config.max_lora_rank}")
 
+        # Determine adapter index - either get a new one or reuse from evicted model
+        if len(self.models) >= self.config.max_lora_adapters:
+            # Evict LRU model and reuse its adapter index
+            lru_model_id = self._find_lru_model()
+            adapter_index = self._evict_model(lru_model_id)
+        else:
+            # Assign new adapter index
+            adapter_index = max((m.adapter_index for m in self.models.values()), default=0) + 1
+
         self.models[model_id] = types.ModelMetadata(
             adapter_index=adapter_index,
             lora_config=lora_config,
+            last_used=time.time(),
         )
 
-        # Create optimizer via backend
-        self.optimizers[model_id] = self.backend.create_optimizer(model_id)
+        # Register model with backend (creates optimizer and configures adapter)
+        self.backend.register_model(model_id, adapter_index, lora_config)
 
-        # Configure adapter's rank and scaling in all LoRA layers
-        self.backend.configure_adapter(adapter_index, lora_config)
+        # Check if we have cached state for this model_id and restore if rank matches
+        cached_state = self._model_cache.pop(model_id, None)
+        if cached_state is not None:
+            cached_rank = cached_state["lora_config"]["rank"]
+            if cached_rank == lora_config.rank:
+                self.backend.insert_checkpoint_data(model_id, cached_state, self.models)
+                logger.info(f"Restored cached state for model {model_id}")
+            else:
+                logger.info(
+                    f"Skipped cache restore for {model_id}: rank mismatch "
+                    f"(cached={cached_rank}, requested={lora_config.rank})"
+                )
 
         logger.info(f"Created LoRA model {model_id} with adapter index {adapter_index}, config {lora_config}")
 
@@ -358,6 +421,10 @@ class TinkerEngine:
         if not valid_requests:
             return error_results
 
+        # Update last_used for all models in this batch
+        for model_id, _ in valid_requests.values():
+            self._touch_model(model_id)
+
         # Prepare batch data
         prepared_batch = self._prepare_model_pass_batch(valid_requests)
 
@@ -374,6 +441,10 @@ class TinkerEngine:
         error_results, valid_requests = self._filter_valid_requests(requests)
         if not valid_requests:
             return error_results
+
+        # Update last_used for all models in this batch
+        for model_id, _ in valid_requests.values():
+            self._touch_model(model_id)
 
         # Prepare batch data
         prepared_batch = self._prepare_model_pass_batch(valid_requests)
@@ -402,6 +473,10 @@ class TinkerEngine:
         if not valid_requests:
             return error_results
 
+        # Update last_used for all models in this batch
+        for model_id, _ in valid_requests.values():
+            self._touch_model(model_id)
+
         # Load sampler weights and get adapter indices
         adapter_indices = self.load_sampler_weights(valid_requests)
 
@@ -418,17 +493,17 @@ class TinkerEngine:
         if model_id not in self.models:
             raise ValueError(f"Model {model_id} not loaded")
 
+        self._touch_model(model_id)
         adapter_index = self.models[model_id].adapter_index
 
-        return self.backend.process_optim_step(
-            model_id, request_data, self.optimizers[model_id], adapter_index
-        )
+        return self.backend.process_optim_step(model_id, adapter_index, request_data)
 
     def process_load_weights(self, model_id: str, request_data: types.LoadWeightsInput) -> types.LoadWeightsOutput:
         """Loads a clean, trimmed training checkpoint."""
         if model_id not in self.models:
             raise ValueError("Model not loaded. Create the model before loading a checkpoint.")
 
+        self._touch_model(model_id)
         checkpoint_dir = (
             self.config.checkpoints_base / request_data.source_model_id / f"{request_data.checkpoint_id}.tar.gz"
         )
@@ -436,7 +511,7 @@ class TinkerEngine:
         with download_and_unpack(checkpoint_dir) as temp_dir:
             checkpoint = checkpoints.restore_checkpoint(
                 ckpt_dir=temp_dir,
-                target=self.backend.extract_checkpoint_data(model_id, self.models, self.optimizers),
+                target=self.backend.extract_checkpoint_data(model_id, self.models),
                 prefix="checkpoint_",
             )
 
@@ -444,7 +519,7 @@ class TinkerEngine:
             raise FileNotFoundError(f"Training checkpoint not found in {checkpoint_dir}")
 
         # Insert checkpoint data into model state via backend
-        self.backend.insert_checkpoint_data(model_id, checkpoint, self.models, self.optimizers)
+        self.backend.insert_checkpoint_data(model_id, checkpoint, self.models)
 
         logger.info(f"Loaded training checkpoint for model {model_id} from {checkpoint_dir}")
         return types.LoadWeightsOutput(type="load_weights")
@@ -457,11 +532,12 @@ class TinkerEngine:
         if model_id not in self.models:
             raise ValueError(f"Model {model_id} not loaded")
 
+        self._touch_model(model_id)
         checkpoint_id = request_data.path
         output_path = self.config.checkpoints_base / model_id / f"{checkpoint_id}.tar.gz"
 
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
-            self.backend.save_checkpoint(output_path, model_id, self.models, self.optimizers)
+            self.backend.save_checkpoint(output_path, model_id, self.models)
             logger.info(f"Saved trimmed training checkpoint for model {model_id} to {output_path}")
 
         return types.SaveWeightsOutput(
@@ -476,6 +552,7 @@ class TinkerEngine:
         if model_id not in self.models:
             raise ValueError(f"Model {model_id} not loaded")
 
+        self._touch_model(model_id)
         lora_model = self.models[model_id]
 
         # Make sure the user cannot store checkpoints in places like ../../<important file>
