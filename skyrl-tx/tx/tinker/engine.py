@@ -567,8 +567,7 @@ class TinkerEngine:
             )
 
         return types.SaveWeightsForSamplerOutput(
-            path=None,  # Newer clients expect None (they track path internally)
-            # path=f"tinker://{model_id}/{checkpoint_id}",
+            path=f"tinker://{model_id}/{checkpoint_id}" if request_data.return_path else None,
             type="save_weights_for_sampler",
             sampling_session_id=request_data.sampling_session_id,
         )

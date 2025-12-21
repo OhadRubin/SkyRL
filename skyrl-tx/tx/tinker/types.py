@@ -130,6 +130,7 @@ class OptimStepOutput(BaseModel):
 class SaveWeightsForSamplerInput(BaseModel):
     path: str
     sampling_session_id: str | None = None  # Created by API, passed through to output
+    return_path: bool = True  # False for new clients that use sampling_session_id instead
 
 
 class SaveWeightsForSamplerOutput(BaseModel):

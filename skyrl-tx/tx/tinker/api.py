@@ -36,7 +36,7 @@ ID_PATTERN = r"^[a-zA-Z0-9_-]+$"
 ID_MAX_LENGTH = 255
 
 # Maximum number of sampler checkpoints to keep per model (oldest are evicted)
-MAX_SAMPLER_CHECKPOINTS_PER_MODEL = 3
+MAX_SAMPLER_CHECKPOINTS_PER_MODEL = 1
 
 
 @asynccontextmanager
@@ -816,11 +816,19 @@ async def save_weights_for_sampler(
     )
     session.add(sampling_db)
 
+    # New clients provide sampling_session_seq_id and expect path=None in response
+    # Old clients provide path directly and expect path in response
+    return_path = request.sampling_session_seq_id is None
+
     request_id = await create_future(
         session=session,
         request_type=types.RequestType.SAVE_WEIGHTS_FOR_SAMPLER,
         model_id=request.model_id,
-        request_data=types.SaveWeightsForSamplerInput(path=request.path, sampling_session_id=sampling_session_id),
+        request_data=types.SaveWeightsForSamplerInput(
+            path=request.path,
+            sampling_session_id=sampling_session_id,
+            return_path=return_path,
+        ),
     )
 
     await session.commit()
