@@ -24,6 +24,8 @@ def _is_retryable_error(exc: BaseException) -> bool:
 class ExternalInferenceClient:
     """Client for calling external inference engines (e.g., vLLM)."""
 
+    SKIP_LAST_K_CHUNKS = 2  # Skip last 2 chunks (user content + assistant prefix)
+
     def __init__(self, engine_config: EngineConfig, db_engine):
         self.base_urls = [f"{url}/v1" for url in engine_config.external_inference_urls]
         self._url_index = 0
@@ -31,11 +33,44 @@ class ExternalInferenceClient:
         self.checkpoints_base = engine_config.checkpoints_base
         self.lora_base_dir = engine_config.external_inference_lora_base
         self.db_engine = db_engine
+        self._prefix_to_server: dict[int, str] = {}  # Stateful: prefix_hash → server URL
 
     def _get_next_url(self) -> str:
-        """Round-robin server selection."""
+        """Round-robin server selection (fallback)."""
         url = self.base_urls[self._url_index % len(self.base_urls)]
         self._url_index += 1
+        return url
+
+    def _compute_prompt_hash(self, sample_req) -> int | None:
+        """Compute hash from prefix chunks (all but last 2) for KV cache affinity routing.
+
+        The last 2 chunks are typically: user message content + assistant prefix.
+        Everything before that is the stable prefix (system prompt, history).
+        """
+        chunks = sample_req.prompt.chunks
+        if len(chunks) <= self.SKIP_LAST_K_CHUNKS:
+            return None  # Not enough chunks to determine prefix
+
+        cacheable_chunks = chunks[:-self.SKIP_LAST_K_CHUNKS]
+        prefix_tokens = tuple(t for chunk in cacheable_chunks for t in chunk.tokens)
+
+        if not prefix_tokens:
+            return None
+
+        return hash(prefix_tokens)
+
+    def _get_url_for_hash(self, prompt_hash: int) -> str:
+        """Stateful hash-based server selection for KV cache affinity.
+
+        First request with a given prefix hash gets assigned to a server via consistent hashing.
+        Subsequent requests with the same hash are routed to the same server (sticky session).
+        """
+        if prompt_hash in self._prefix_to_server:
+            return self._prefix_to_server[prompt_hash]
+
+        # First time seeing this prefix - assign via consistent hash
+        url = self.base_urls[prompt_hash % len(self.base_urls)]
+        self._prefix_to_server[prompt_hash] = url
         return url
 
     async def call_and_store_result(
@@ -47,12 +82,27 @@ class ExternalInferenceClient:
     ):
         """Background task to call external engine and store result in database.
 
-        Tries servers in round-robin order, falling back to next server on connection failures.
+        Uses hash-based routing for KV cache affinity: requests with the same prefix
+        are routed to the same server. Falls back to round-robin on connection failures.
         """
         last_error = None
+        prompt_hash = self._compute_prompt_hash(sample_req)
+        tried_urls: set[str] = set()
 
-        for _ in range(len(self.base_urls)):
-            base_url = self._get_next_url()
+        for attempt in range(len(self.base_urls)):
+            if attempt == 0 and prompt_hash is not None:
+                # First attempt: use hash-based routing for KV cache affinity
+                base_url = self._get_url_for_hash(prompt_hash)
+            else:
+                # Fallback: round-robin through remaining servers
+                base_url = self._get_next_url()
+                while base_url in tried_urls and len(tried_urls) < len(self.base_urls):
+                    base_url = self._get_next_url()
+
+            if base_url in tried_urls:
+                continue  # Already tried this server
+            tried_urls.add(base_url)
+
             try:
                 async with httpx.AsyncClient(
                     base_url=base_url,
