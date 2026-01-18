@@ -24,7 +24,7 @@ def _is_retryable_error(exc: BaseException) -> bool:
 class ExternalInferenceClient:
     """Client for calling external inference engines (e.g., vLLM)."""
 
-    SKIP_LAST_K_CHUNKS = 2  # Skip last 2 chunks (user content + assistant prefix)
+    MAX_PREFIX_LEVELS = 4  # Try up to 4 prefix granularities for hierarchical matching
 
     def __init__(self, engine_config: EngineConfig, db_engine):
         self.base_urls = [f"{url}/v1" for url in engine_config.external_inference_urls]
@@ -51,40 +51,45 @@ class ExternalInferenceClient:
         self._url_index += 1
         return url
 
-    def _compute_prompt_hash(self, sample_req) -> int | None:
-        """Compute hash from prefix chunks (all but last 2) for KV cache affinity routing.
+    def _compute_prefix_hashes(self, sample_req) -> list[int]:
+        """Compute hashes for prefix chunks at multiple granularities.
 
-        The last 2 chunks are typically: user message content + assistant prefix.
-        Everything before that is the stable prefix (system prompt, history).
+        Returns hashes for chunks[:-1], chunks[:-2], chunks[:-3], chunks[:-4]
+        (longest to shortest) for hierarchical matching.
         """
         chunks = sample_req.prompt.chunks
-        if len(chunks) <= self.SKIP_LAST_K_CHUNKS:
-            return None  # Not enough chunks to determine prefix
+        hashes = []
 
-        cacheable_chunks = chunks[:-self.SKIP_LAST_K_CHUNKS]
-        prefix_tokens = tuple(t for chunk in cacheable_chunks for t in chunk.tokens)
+        for skip in range(1, self.MAX_PREFIX_LEVELS + 1):
+            if len(chunks) <= skip:
+                break
+            prefix_chunks = chunks[:-skip]
+            prefix_tokens = tuple(t for chunk in prefix_chunks for t in chunk.tokens)
+            if prefix_tokens:
+                hashes.append(hash(prefix_tokens))
 
-        if not prefix_tokens:
-            return None
+        # logger.info(f"Prefix hashes: num_chunks={len(chunks)}, num_hashes={len(hashes)}, hashes={hashes}")
+        return hashes
 
-        return hash(prefix_tokens)
+    def _get_url_for_hashes(self, prefix_hashes: list[int]) -> str:
+        """Hierarchical hash-based server selection for KV cache affinity.
 
-    def _get_url_for_hash(self, prompt_hash: int) -> str:
-        """Stateful hash-based server selection for KV cache affinity.
-
-        First request with a given prefix hash gets assigned to a server via consistent hashing.
-        Subsequent requests with the same hash are routed to the same server (sticky session).
+        Tries each prefix hash (longest to shortest). If any matches, route there (hit).
+        If none match, round-robin assign and store all hashes for future matching.
         """
-        if prompt_hash in self._prefix_to_server:
-            self._cache_hits += 1
-            return self._prefix_to_server[prompt_hash]
+        for i, h in enumerate(prefix_hashes):
+            if h in self._prefix_to_server:
+                self._cache_hits += 1
+                # logger.info(f"Cache HIT at level {i} (skip={i+1}), hash={h}, url={self._prefix_to_server[h]}, cache_size={len(self._prefix_to_server)}")
+                return self._prefix_to_server[h]
 
         self._cache_misses += 1
-        total = self._cache_hits + self._cache_misses
-        miss_rate = self._cache_misses / total
+        url = self._get_next_url()
 
-        url = self.base_urls[prompt_hash % len(self.base_urls)]
-        self._prefix_to_server[prompt_hash] = url
+        for h in prefix_hashes:
+            self._prefix_to_server[h] = url
+
+        # logger.info(f"Cache MISS, assigned url={url}, stored {len(prefix_hashes)} hashes, cache_size={len(self._prefix_to_server)}")
         return url
 
     async def call_and_store_result(
@@ -100,13 +105,13 @@ class ExternalInferenceClient:
         are routed to the same server. Falls back to round-robin on connection failures.
         """
         last_error = None
-        prompt_hash = self._compute_prompt_hash(sample_req)
+        prefix_hashes = self._compute_prefix_hashes(sample_req)
         tried_urls: set[str] = set()
 
         for attempt in range(len(self.base_urls)):
-            if attempt == 0 and prompt_hash is not None:
-                # First attempt: use hash-based routing for KV cache affinity
-                base_url = self._get_url_for_hash(prompt_hash)
+            if attempt == 0 and prefix_hashes:
+                # First attempt: use hierarchical hash-based routing for KV cache affinity
+                base_url = self._get_url_for_hashes(prefix_hashes)
             else:
                 # Fallback: round-robin through remaining servers
                 base_url = self._get_next_url()
