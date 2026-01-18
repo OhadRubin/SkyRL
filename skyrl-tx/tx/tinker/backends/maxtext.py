@@ -337,23 +337,26 @@ class MaxTextBackend(AbstractBackend):
 
         logger.info(f"Precompilation complete for {len(seq_lens)} sequence lengths")
 
-    def process_forward_backward_batch(
+    def _process_forward_backward_batch(
         self,
         prepared_batch: types.PreparedModelPassBatch,
-    ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
-        """Process forward_backward requests using MaxText model."""
+    ) -> list[dict]:
+        """Process forward_backward requests using MaxText model (single bucket).
+
+        Returns:
+            List of per-sequence outputs, where each dict contains 'elementwise_loss' and 'logprobs'.
+            The list is indexed by position in the bucket (not by request_id).
+        """
         all_input_ids = prepared_batch.all_input_ids
         all_targets = prepared_batch.all_targets
         all_token_weights = prepared_batch.all_token_weights
         all_sampling_logprobs = prepared_batch.all_sampling_logprobs
         all_advantages = prepared_batch.all_advantages
         all_loss_fn_types = prepared_batch.all_loss_fn_types
-        request_batch_slices = prepared_batch.request_batch_slices
 
         if not all_input_ids:
-            return {}
+            return []
 
-        results = {}
         max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids), self.config.min_seq_len)
         input_ids = pad_batch(all_input_ids, max_len, np.int32)
         target_ids = pad_batch(all_targets, max_len, np.int32)
@@ -443,31 +446,138 @@ class MaxTextBackend(AbstractBackend):
             if idx >= original_batch_size:
                 break
 
-        for request_id, _, start_idx, end_idx in request_batch_slices:
-            loss_fn_outputs = []
-            for i in range(start_idx, end_idx):
-                token_losses = token_losses_out[i]
-                token_logprobs = logprobs_out[i]
-                loss_fn_outputs.append({
-                    "elementwise_loss": {
-                        "data": token_losses.tolist(),
-                        "dtype": "float32",
-                        "shape": [token_losses.shape[0]],
-                    },
-                    "logprobs": {
-                        "data": token_logprobs.tolist(),
-                        "dtype": "float32",
-                        "shape": [token_logprobs.shape[0]],
-                    },
-                })
+        # Return per-sequence outputs (indexed by bucket position)
+        per_seq_outputs = []
+        for i in range(len(token_losses_out)):
+            token_losses = token_losses_out[i]
+            token_logprobs = logprobs_out[i]
+            per_seq_outputs.append({
+                "elementwise_loss": {
+                    "data": token_losses.tolist(),
+                    "dtype": "float32",
+                    "shape": [token_losses.shape[0]],
+                },
+                "logprobs": {
+                    "data": token_logprobs.tolist(),
+                    "dtype": "float32",
+                    "shape": [token_logprobs.shape[0]],
+                },
+            })
 
-            results[request_id] = types.ForwardBackwardOutput(
+        return per_seq_outputs
+
+    def split_batch_by_bucket(
+        self,
+        prepared_batch: types.PreparedModelPassBatch,
+    ) -> dict[int, tuple[types.PreparedModelPassBatch, list[int]]]:
+        """Split a prepared batch into buckets based on rounded-up sequence length.
+
+        Uses round_up_seq_len to bucket sequences, so sequences of similar lengths
+        are processed together, minimizing padding overhead.
+
+        Args:
+            prepared_batch: The full batch to split
+
+        Returns:
+            Dict mapping bucket_seq_len -> (PreparedModelPassBatch, seq_idx_map)
+            where seq_idx_map[bucket_idx] = original_seq_idx
+        """
+        buckets: dict[int, dict] = {}
+
+        for seq_idx, input_ids in enumerate(prepared_batch.all_input_ids):
+            bucket_key = round_up_seq_len(len(input_ids), self.config.min_seq_len)
+
+            if bucket_key not in buckets:
+                buckets[bucket_key] = {
+                    "all_input_ids": [],
+                    "all_targets": [],
+                    "all_token_weights": [],
+                    "all_sampling_logprobs": [],
+                    "all_advantages": [],
+                    "all_adapter_indices": [],
+                    "all_loss_fn_types": [],
+                    "seq_idx_map": [],  # Maps bucket index -> original index
+                }
+
+            bucket = buckets[bucket_key]
+            bucket["all_input_ids"].append(input_ids)
+            bucket["all_targets"].append(prepared_batch.all_targets[seq_idx])
+            bucket["all_token_weights"].append(prepared_batch.all_token_weights[seq_idx])
+            bucket["all_sampling_logprobs"].append(prepared_batch.all_sampling_logprobs[seq_idx])
+            bucket["all_advantages"].append(prepared_batch.all_advantages[seq_idx])
+            bucket["all_adapter_indices"].append(prepared_batch.all_adapter_indices[seq_idx])
+            bucket["all_loss_fn_types"].append(prepared_batch.all_loss_fn_types[seq_idx])
+            bucket["seq_idx_map"].append(seq_idx)
+
+        result = {}
+        for bucket_key, bucket_data in buckets.items():
+            seq_idx_map = bucket_data.pop("seq_idx_map")
+
+            # request_batch_slices not needed - aggregation happens in process_forward_backward_batch
+            batch = types.PreparedModelPassBatch(
+                all_input_ids=bucket_data["all_input_ids"],
+                all_targets=bucket_data["all_targets"],
+                all_token_weights=bucket_data["all_token_weights"],
+                all_sampling_logprobs=bucket_data["all_sampling_logprobs"],
+                all_advantages=bucket_data["all_advantages"],
+                all_adapter_indices=bucket_data["all_adapter_indices"],
+                all_loss_fn_types=bucket_data["all_loss_fn_types"],
+                request_batch_slices=[],
+            )
+            result[bucket_key] = (batch, seq_idx_map)
+
+        return result
+
+    def process_forward_backward_batch(
+        self,
+        prepared_batch: types.PreparedModelPassBatch,
+    ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
+        """Process forward_backward requests, bucketing by sequence length to minimize padding.
+
+        Splits the batch into buckets based on rounded-up sequence length, processes
+        each bucket separately, and merges results while preserving original sequence order.
+        """
+        if not prepared_batch.all_input_ids:
+            return {}
+
+        buckets = self.split_batch_by_bucket(prepared_batch)
+
+        if len(buckets) > 1:
+            bucket_sizes = {k: len(v[0].all_input_ids) for k, v in buckets.items()}
+            logger.info(f"Split batch into {len(buckets)} buckets by seq_len: {bucket_sizes}")
+
+        # Collect per-sequence outputs indexed by original sequence index
+        per_seq_outputs: dict[int, dict] = {}
+
+        for bucket_seq_len, (bucket_batch, seq_idx_map) in sorted(buckets.items()):
+            bucket_outputs = self._process_forward_backward_batch(bucket_batch)
+
+            # Map bucket outputs back to original sequence indices
+            for bucket_idx, output in enumerate(bucket_outputs):
+                orig_idx = seq_idx_map[bucket_idx]
+                per_seq_outputs[orig_idx] = output
+
+        # Aggregate per-sequence outputs back into per-request results
+        all_results: dict[str, types.ForwardBackwardOutput | types.ErrorResponse] = {}
+
+        for request_id, _, start_idx, end_idx in prepared_batch.request_batch_slices:
+            loss_fn_outputs = []
+
+            for orig_idx in range(start_idx, end_idx):
+                if orig_idx not in per_seq_outputs:
+                    raise RuntimeError(
+                        f"Missing output for sequence {orig_idx} in request {request_id}. "
+                        f"This indicates a bug in bucket splitting/merging."
+                    )
+                loss_fn_outputs.append(per_seq_outputs[orig_idx])
+
+            all_results[request_id] = types.ForwardBackwardOutput(
                 loss_fn_output_type="scalar",
                 loss_fn_outputs=loss_fn_outputs,
                 metrics={},
             )
 
-        return results
+        return all_results
 
     def process_optim_step(
         self,
