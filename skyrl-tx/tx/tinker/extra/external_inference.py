@@ -34,6 +34,16 @@ class ExternalInferenceClient:
         self.lora_base_dir = engine_config.external_inference_lora_base
         self.db_engine = db_engine
         self._prefix_to_server: dict[int, str] = {}  # Stateful: prefix_hash → server URL
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+    @property
+    def cache_stats(self) -> str:
+        total = self._cache_hits + self._cache_misses
+        if total == 0:
+            return "no requests yet"
+        miss_rate = self._cache_misses / total
+        return f"miss_rate={miss_rate:.2%} ({self._cache_misses}/{total})"
 
     def _get_next_url(self) -> str:
         """Round-robin server selection (fallback)."""
@@ -66,9 +76,13 @@ class ExternalInferenceClient:
         Subsequent requests with the same hash are routed to the same server (sticky session).
         """
         if prompt_hash in self._prefix_to_server:
+            self._cache_hits += 1
             return self._prefix_to_server[prompt_hash]
 
-        # First time seeing this prefix - assign via consistent hash
+        self._cache_misses += 1
+        total = self._cache_hits + self._cache_misses
+        miss_rate = self._cache_misses / total
+
         url = self.base_urls[prompt_hash % len(self.base_urls)]
         self._prefix_to_server[prompt_hash] = url
         return url
