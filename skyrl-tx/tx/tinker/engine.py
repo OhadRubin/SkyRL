@@ -300,6 +300,10 @@ class TinkerEngine:
         # Filter: only include ops that come before their model's barrier
         batchable = [op for op in ops if op.model_id not in barriers or op.request_id < barriers[op.model_id]]
 
+        # Apply sequence limit if configured
+        if self.config.train_max_num_sequences > 0:
+            batchable = batchable[:self.config.train_max_num_sequences]
+
         return {
             f.request_id: (f.model_id, types.ForwardBackwardInput.model_validate(f.request_data)) for f in batchable
         }

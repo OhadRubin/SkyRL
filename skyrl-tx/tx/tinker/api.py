@@ -36,7 +36,7 @@ ID_PATTERN = r"^[a-zA-Z0-9_-]+$"
 ID_MAX_LENGTH = 255
 
 # Maximum number of sampler checkpoints to keep per model (oldest are evicted)
-MAX_SAMPLER_CHECKPOINTS_PER_MODEL = 1
+MAX_SAMPLER_CHECKPOINTS_PER_MODEL = 2
 
 _last_cache_stats_log_time: float = 0
 
