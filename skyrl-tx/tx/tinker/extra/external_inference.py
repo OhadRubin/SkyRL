@@ -1,7 +1,8 @@
+import asyncio
 import shutil
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, retry_if_exception_type
 from datetime import datetime, timezone
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -12,9 +13,16 @@ from tx.utils.log import logger
 from tx.utils.storage import download_and_unpack
 
 
+TIMEOUT_ERROR_PREFIX = "TINKER_TIMEOUT: "
+UNHEALTHY_DURATION_SECONDS = 120  # 2 minutes
+
+
 class AllServersFailed(Exception):
     """Raised when all servers fail in a single cycle."""
-    pass
+
+    def __init__(self, message: str, is_timeout: bool):
+        super().__init__(message)
+        self.is_timeout = is_timeout
 
 
 class ExternalInferenceClient:
@@ -33,6 +41,7 @@ class ExternalInferenceClient:
         self._prefix_to_server: dict[int, str] = {}  # Stateful: prefix_hash → server URL
         self._cache_hits = 0
         self._cache_misses = 0
+        self._unhealthy_urls: dict[str, datetime] = {}  # url → timestamp when marked unhealthy
 
     @property
     def cache_stats(self) -> str:
@@ -42,11 +51,52 @@ class ExternalInferenceClient:
         miss_rate = self._cache_misses / total
         return f"miss_rate={miss_rate:.2%} ({self._cache_misses}/{total})"
 
-    def _get_next_url(self) -> str:
-        """Round-robin server selection (fallback)."""
-        url = self.base_urls[self._url_index % len(self.base_urls)]
-        self._url_index += 1
-        return url
+    @property
+    def unhealthy_urls(self) -> list[str]:
+        """Return list of currently unhealthy URLs."""
+        return [url for url in self._unhealthy_urls if not self._is_url_healthy(url)]
+
+    def _is_url_healthy(self, url: str) -> bool:
+        """Check if URL is healthy (not marked unhealthy or unhealthy period expired)."""
+        if url not in self._unhealthy_urls:
+            return True
+        marked_at = self._unhealthy_urls[url]
+        elapsed = (datetime.now(timezone.utc) - marked_at).total_seconds()
+        if elapsed >= UNHEALTHY_DURATION_SECONDS:
+            del self._unhealthy_urls[url]
+            logger.info(f"URL {url} recovered after {elapsed:.1f}s unhealthy period")
+            return True
+        return False
+
+    def _mark_url_unhealthy(self, url: str):
+        """Mark URL as unhealthy for UNHEALTHY_DURATION_SECONDS."""
+        self._unhealthy_urls[url] = datetime.now(timezone.utc)
+        logger.warning(f"Marked {url} as unhealthy for {UNHEALTHY_DURATION_SECONDS}s")
+
+    def _seconds_until_any_healthy(self) -> float | None:
+        """Return seconds until the earliest unhealthy URL recovers, or None if any URL is already healthy."""
+        if not self._unhealthy_urls:
+            return None
+        now = datetime.now(timezone.utc)
+        min_wait = float("inf")
+        for url, marked_at in self._unhealthy_urls.items():
+            elapsed = (now - marked_at).total_seconds()
+            remaining = UNHEALTHY_DURATION_SECONDS - elapsed
+            if remaining <= 0:
+                return None
+            min_wait = min(min_wait, remaining)
+        if min_wait == float("inf"):
+            return None
+        return min_wait
+
+    def _get_next_url(self) -> str | None:
+        """Round-robin server selection, skipping unhealthy URLs."""
+        for _ in range(len(self.base_urls)):
+            url = self.base_urls[self._url_index % len(self.base_urls)]
+            self._url_index += 1
+            if self._is_url_healthy(url):
+                return url
+        return None
 
     def _compute_prefix_hashes(self, sample_req) -> list[int]:
         """Compute hashes for prefix chunks at multiple granularities.
@@ -70,25 +120,27 @@ class ExternalInferenceClient:
         # logger.info(f"Prefix hashes: num_chunks={len(chunks)}, num_hashes={len(hashes)}, hashes={hashes}")
         return hashes
 
-    def _get_url_for_hashes(self, prefix_hashes: list[int]) -> str:
+    def _get_url_for_hashes(self, prefix_hashes: list[int]) -> str | None:
         """Hierarchical hash-based server selection for KV cache affinity.
 
-        Tries each prefix hash (longest to shortest). If any matches, route there (hit).
-        If none match, round-robin assign and store all hashes for future matching.
+        Tries each prefix hash (longest to shortest). If any matches and is healthy, route there (hit).
+        If none match or cached URL is unhealthy, round-robin assign and store all hashes for future matching.
+        Returns None if all URLs are unhealthy.
         """
         for i, h in enumerate(prefix_hashes):
             if h in self._prefix_to_server:
-                self._cache_hits += 1
-                # logger.info(f"Cache HIT at level {i} (skip={i+1}), hash={h}, url={self._prefix_to_server[h]}, cache_size={len(self._prefix_to_server)}")
-                return self._prefix_to_server[h]
+                cached_url = self._prefix_to_server[h]
+                if self._is_url_healthy(cached_url):
+                    self._cache_hits += 1
+                    return cached_url
 
         self._cache_misses += 1
         url = self._get_next_url()
 
-        for h in prefix_hashes:
-            self._prefix_to_server[h] = url
+        if url is not None:
+            for h in prefix_hashes:
+                self._prefix_to_server[h] = url
 
-        # logger.info(f"Cache MISS, assigned url={url}, stored {len(prefix_hashes)} hashes, cache_size={len(self._prefix_to_server)}")
         return url
 
     async def call_and_store_result(
@@ -105,45 +157,64 @@ class ExternalInferenceClient:
         """
         prefix_hashes = self._compute_prefix_hashes(sample_req)
 
-        @retry(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=5, min=5, max=60),
-            retry=retry_if_exception_type(AllServersFailed),
-            reraise=True,
-        )
+        # @retry(
+        #     stop=stop_after_attempt(3),
+        #     retry=retry_if_exception_type(AllServersFailed),
+        #     reraise=True,
+        # )
         async def _try_all_servers() -> types.SampleOutput:
-            tried_urls: set[str] = set()
+            # May block waiting for unhealthy servers to recover; caller handles timeout.
             last_error: Exception | None = None
+            is_timeout_error = False
 
-            for attempt in range(len(self.base_urls)):
-                if attempt == 0 and prefix_hashes:
-                    base_url = self._get_url_for_hashes(prefix_hashes)
-                else:
-                    base_url = self._get_next_url()
-                    while base_url in tried_urls and len(tried_urls) < len(self.base_urls):
+            while True:
+                tried_urls: set[str] = set()
+
+                for attempt in range(len(self.base_urls)):
+                    if attempt == 0 and prefix_hashes:
+                        base_url = self._get_url_for_hashes(prefix_hashes)
+                    else:
                         base_url = self._get_next_url()
+                        while base_url is not None and base_url in tried_urls and len(tried_urls) < len(self.base_urls):
+                            base_url = self._get_next_url()
 
-                if base_url in tried_urls:
-                    continue
-                tried_urls.add(base_url)
+                    if base_url is None:
+                        break
+                    if base_url in tried_urls:
+                        continue
+                    tried_urls.add(base_url)
 
-                try:
-                    async with httpx.AsyncClient(
-                        base_url=base_url,
-                        headers={"Authorization": f"Bearer {self.api_key}"},
-                        timeout=httpx.Timeout(600.0, connect=10.0),
-                    ) as http_client:
-                        result = await self._forward_to_engine(sample_req, model_id, checkpoint_id, http_client)
-                    for h in prefix_hashes:
-                        self._prefix_to_server[h] = base_url
-                    return result
-                except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
-                    logger.warning(f"Server {base_url} failed, trying next: {e}")
-                    last_error = e
-                    continue
+                    try:
+                        async with httpx.AsyncClient(
+                            base_url=base_url,
+                            headers={"Authorization": f"Bearer {self.api_key}"},
+                            timeout=httpx.Timeout(300.0, connect=10.0),
+                        ) as http_client:
+                            result = await self._forward_to_engine(sample_req, model_id, checkpoint_id, http_client)
+                        for h in prefix_hashes:
+                            self._prefix_to_server[h] = base_url
+                        return result
+                    except httpx.HTTPStatusError as e:
+                        logger.warning(f"Server {base_url} failed with HTTP {e.response.status_code}, trying next: {e}")
+                        last_error = e
+                        if e.response.status_code >= 500:
+                            self._mark_url_unhealthy(base_url)
+                        continue
+                    except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException) as e:
+                        logger.warning(f"Server {base_url} failed, trying next: {e}")
+                        last_error = e
+                        is_timeout_error = isinstance(e, httpx.TimeoutException)
+                        self._mark_url_unhealthy(base_url)
+                        continue
 
-            self._prefix_to_server.clear()
-            raise AllServersFailed(f"All {len(self.base_urls)} servers failed, last error: {last_error}")
+                wait_seconds = self._seconds_until_any_healthy()
+                if wait_seconds is None:
+                    raise AllServersFailed(
+                        f"All {len(self.base_urls)} servers failed, last error: {last_error}",
+                        is_timeout=is_timeout_error,
+                    )
+                logger.info(f"All servers unhealthy, waiting {wait_seconds:.1f}s for recovery")
+                await asyncio.sleep(wait_seconds + 0.1)
 
         try:
             result = await _try_all_servers()
@@ -151,7 +222,8 @@ class ExternalInferenceClient:
             status = RequestStatus.COMPLETED
         except AllServersFailed as e:
             logger.exception(f"All external engines failed after retries")
-            result_data = {"error": str(e), "status": "failed"}
+            error_msg = f"{TIMEOUT_ERROR_PREFIX}{e}" if e.is_timeout else str(e)
+            result_data = {"error": error_msg, "status": "failed"}
             status = RequestStatus.FAILED
         except Exception as e:
             logger.exception(f"Unexpected error in external inference")
