@@ -33,7 +33,7 @@ class EngineConfig(BaseModel):
         description="Maximum batch size (measured in number of sequences) for sampling/generation; 0 means disabled (use full batch)",
     )
     train_max_num_sequences: int = Field(
-        default=8,
+        default=4,
         description="Maximum batch size (measured in number of sequences) for training; 0 means disabled (use full batch)",
     )
     enforce_eager: bool = Field(default=False, description="Disable JAX JIT compilation")

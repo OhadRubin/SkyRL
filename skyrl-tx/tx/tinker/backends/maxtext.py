@@ -182,6 +182,7 @@ class MaxTextBackend(AbstractBackend):
     def _create_loss_and_grad_fn(self):
         """Create loss and gradient functions for MaxText model."""
 
+        # TODO: must fix this slop - clip_low/clip_high are parallel arrays, should be bundled with other per-example data
         def loss_for_maxtext_model(
             model,
             input_ids: jax.Array,
@@ -191,13 +192,16 @@ class MaxTextBackend(AbstractBackend):
             loss_fn_types: jax.Array,
             sampling_logprobs: jax.Array,
             advantages: jax.Array,
+            clip_low: jax.Array,
+            clip_high: jax.Array,
         ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
             """Loss for MaxText model with dynamic loss function selection."""
             logits, _ = model(input_ids, positions, None, None, False)
             logprobs = jax.nn.log_softmax(logits, axis=-1)
             target_logprobs = jnp.take_along_axis(logprobs, target_ids[..., None], axis=-1).squeeze(-1)
 
-            def compute_loss_per_example(loss_fn_type, target_logprobs, loss_mask, sampling_logprobs, advantages):
+            # TODO: must fix this slop - clip_low/clip_high passed separately instead of bundled config
+            def compute_loss_per_example(loss_fn_type, target_logprobs, loss_mask, sampling_logprobs, advantages, clip_low, clip_high):
                 return jax.lax.switch(
                     loss_fn_type,
                     LOSS_FUNCTIONS,
@@ -205,6 +209,8 @@ class MaxTextBackend(AbstractBackend):
                     loss_mask,
                     sampling_logprobs,
                     advantages,
+                    clip_low,
+                    clip_high,
                 )
 
             per_token_losses = jax.vmap(compute_loss_per_example)(
@@ -213,6 +219,8 @@ class MaxTextBackend(AbstractBackend):
                 loss_mask,
                 sampling_logprobs,
                 advantages,
+                clip_low,
+                clip_high,
             )
 
             per_seq_loss = per_token_losses.sum(axis=-1) / jnp.maximum(loss_mask.sum(axis=-1), 1e-9)
@@ -226,11 +234,11 @@ class MaxTextBackend(AbstractBackend):
         )
 
         def forward_backward_maxtext(
-            model, input_ids, positions, target_ids, loss_mask, loss_fn_types, sampling_logprobs, advantages,
+            model, input_ids, positions, target_ids, loss_mask, loss_fn_types, sampling_logprobs, advantages, clip_low, clip_high,
         ) -> tuple[jax.Array, jax.Array, jax.Array, nnx.State]:
             """Forward-backward for MaxText model."""
             (loss, (target_logprobs, per_token_losses)), grads = loss_and_grad_fn(
-                model, input_ids, positions, target_ids, loss_mask, loss_fn_types, sampling_logprobs, advantages,
+                model, input_ids, positions, target_ids, loss_mask, loss_fn_types, sampling_logprobs, advantages, clip_low, clip_high,
             )
             return loss, target_logprobs, per_token_losses, grads
 
@@ -242,8 +250,8 @@ class MaxTextBackend(AbstractBackend):
             with jax.set_mesh(self.mesh), nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
                 self._forward_backward = jax.jit(
                     forward_backward_maxtext,
-                    # model, input_ids, positions, target_ids, loss_mask, loss_fn_types (1D), sampling_logprobs, advantages
-                    in_shardings=(None, data_sharding, data_sharding, data_sharding, data_sharding, None, data_sharding, data_sharding),
+                    # model, input_ids, positions, target_ids, loss_mask, loss_fn_types (1D), sampling_logprobs, advantages, clip_low (1D), clip_high (1D)
+                    in_shardings=(None, data_sharding, data_sharding, data_sharding, data_sharding, None, data_sharding, data_sharding, None, None),
                 )
 
         def optim_step(model, optimizer, grads):
@@ -325,11 +333,16 @@ class MaxTextBackend(AbstractBackend):
                 dummy_sampling_logprobs = jax.device_put(dummy_sampling_logprobs, data_sharding)
                 dummy_advantages = jax.device_put(dummy_advantages, data_sharding)
 
+                # TODO: must fix this slop - hardcoded default clip values
+                dummy_clip_low = jnp.full((micro_bs,), 0.8, dtype=jnp.float32)
+                dummy_clip_high = jnp.full((micro_bs,), 1.2, dtype=jnp.float32)
+
                 with nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
                     with self._jit_timing_context(seq_len, mode="train"):
                         _, _, _, grads = self._forward_backward(
                             self.model, dummy_input_ids, dummy_positions, dummy_target_ids, dummy_loss_mask,
                             dummy_loss_fn_types, dummy_sampling_logprobs, dummy_advantages,
+                            dummy_clip_low, dummy_clip_high,
                         )
                         self.accumulated_grads = self.accumulated_grads.add(grads, micro_bs)
 
@@ -353,6 +366,8 @@ class MaxTextBackend(AbstractBackend):
         all_sampling_logprobs = prepared_batch.all_sampling_logprobs
         all_advantages = prepared_batch.all_advantages
         all_loss_fn_types = prepared_batch.all_loss_fn_types
+        all_clip_low = prepared_batch.all_clip_low  # TODO: must fix this slop - parallel arrays
+        all_clip_high = prepared_batch.all_clip_high  # TODO: must fix this slop - parallel arrays
 
         if not all_input_ids:
             return []
@@ -364,6 +379,8 @@ class MaxTextBackend(AbstractBackend):
         sampling_logprobs = pad_batch(all_sampling_logprobs, max_len, np.float32)
         advantages = pad_batch(all_advantages, max_len, np.float32)
         loss_fn_types = jnp.array(all_loss_fn_types, dtype=jnp.int32)
+        clip_low = jnp.array(all_clip_low, dtype=jnp.float32)  # TODO: must fix this slop - parallel arrays
+        clip_high = jnp.array(all_clip_high, dtype=jnp.float32)  # TODO: must fix this slop - parallel arrays
 
         batch_size = input_ids.shape[0]
         seq_len = input_ids.shape[1]
@@ -380,6 +397,9 @@ class MaxTextBackend(AbstractBackend):
             sampling_logprobs = np.pad(sampling_logprobs, ((0, pad_size), (0, 0)), mode='constant', constant_values=0)
             advantages = np.pad(advantages, ((0, pad_size), (0, 0)), mode='constant', constant_values=0)
             loss_fn_types = jnp.pad(loss_fn_types, (0, pad_size), mode='constant', constant_values=0)
+            # TODO: must fix this slop - parallel arrays need manual padding
+            clip_low = jnp.pad(clip_low, (0, pad_size), mode='constant', constant_values=0.8)
+            clip_high = jnp.pad(clip_high, (0, pad_size), mode='constant', constant_values=1.2)
             batch_size = padded_batch_size
             logger.info(f"Padded batch from {original_batch_size} to {padded_batch_size} for FSDP sharding")
 
@@ -407,6 +427,8 @@ class MaxTextBackend(AbstractBackend):
                     mb_loss_fn_types = loss_fn_types[mb_start:mb_end]  # 1D, no sharding needed
                     mb_sampling_logprobs = jax.device_put(sampling_logprobs[mb_start:mb_end], data_sharding)
                     mb_advantages = jax.device_put(advantages[mb_start:mb_end], data_sharding)
+                    mb_clip_low = clip_low[mb_start:mb_end]  # 1D, no sharding needed
+                    mb_clip_high = clip_high[mb_start:mb_end]  # 1D, no sharding needed
 
                     _, target_logprobs, per_token_losses, grads = self._forward_backward(
                         self.model,
@@ -417,6 +439,8 @@ class MaxTextBackend(AbstractBackend):
                         mb_loss_fn_types,
                         mb_sampling_logprobs,
                         mb_advantages,
+                        mb_clip_low,
+                        mb_clip_high,
                     )
 
                     _ = jax.device_get(target_logprobs)
@@ -496,6 +520,8 @@ class MaxTextBackend(AbstractBackend):
                     "all_advantages": [],
                     "all_adapter_indices": [],
                     "all_loss_fn_types": [],
+                    "all_clip_low": [],  # TODO: must fix this slop - parallel arrays
+                    "all_clip_high": [],  # TODO: must fix this slop - parallel arrays
                     "seq_idx_map": [],  # Maps bucket index -> original index
                 }
 
@@ -507,6 +533,8 @@ class MaxTextBackend(AbstractBackend):
             bucket["all_advantages"].append(prepared_batch.all_advantages[seq_idx])
             bucket["all_adapter_indices"].append(prepared_batch.all_adapter_indices[seq_idx])
             bucket["all_loss_fn_types"].append(prepared_batch.all_loss_fn_types[seq_idx])
+            bucket["all_clip_low"].append(prepared_batch.all_clip_low[seq_idx])
+            bucket["all_clip_high"].append(prepared_batch.all_clip_high[seq_idx])
             bucket["seq_idx_map"].append(seq_idx)
 
         result = {}
@@ -522,6 +550,8 @@ class MaxTextBackend(AbstractBackend):
                 all_advantages=bucket_data["all_advantages"],
                 all_adapter_indices=bucket_data["all_adapter_indices"],
                 all_loss_fn_types=bucket_data["all_loss_fn_types"],
+                all_clip_low=bucket_data["all_clip_low"],
+                all_clip_high=bucket_data["all_clip_high"],
                 request_batch_slices=[],
             )
             result[bucket_key] = (batch, seq_idx_map)

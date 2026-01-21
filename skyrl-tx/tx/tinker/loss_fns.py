@@ -10,14 +10,24 @@ def safe_loss_mask(loss_output: jax.Array, loss_mask: jax.Array) -> jax.Array:
 
 
 def cross_entropy_loss(
-    target_logprobs: jax.Array, loss_mask: jax.Array, sampling_logprobs: jax.Array, advantages: jax.Array
+    target_logprobs: jax.Array,
+    loss_mask: jax.Array,
+    sampling_logprobs: jax.Array,
+    advantages: jax.Array,
+    clip_low: jax.Array,  # TODO: must fix this slop - unused param added for uniform signature across loss fns
+    clip_high: jax.Array,  # TODO: must fix this slop - unused param added for uniform signature across loss fns
 ) -> jax.Array:
     "Standard cross-entropy loss (i.e., negative log-likelihood)."
     return -safe_loss_mask(target_logprobs, loss_mask)
 
 
 def importance_sampling_loss(
-    target_logprobs: jax.Array, loss_mask: jax.Array, sampling_logprobs: jax.Array, advantages: jax.Array
+    target_logprobs: jax.Array,
+    loss_mask: jax.Array,
+    sampling_logprobs: jax.Array,
+    advantages: jax.Array,
+    clip_low: jax.Array,  # TODO: must fix this slop - unused param added for uniform signature across loss fns
+    clip_high: jax.Array,  # TODO: must fix this slop - unused param added for uniform signature across loss fns
 ) -> jax.Array:
     "Importance sampling loss with target_logprobs from learner policy and sampling_logprobs from sampling policy."
     prob_ratio = jnp.exp(target_logprobs - sampling_logprobs)
@@ -25,11 +35,16 @@ def importance_sampling_loss(
 
 
 def ppo_loss(
-    target_logprobs: jax.Array, loss_mask: jax.Array, sampling_logprobs: jax.Array, advantages: jax.Array
+    target_logprobs: jax.Array,
+    loss_mask: jax.Array,
+    sampling_logprobs: jax.Array,
+    advantages: jax.Array,
+    clip_low: jax.Array,
+    clip_high: jax.Array,
 ) -> jax.Array:
     "PPO style clipped version of the importance sampling loss."
     prob_ratio = jnp.exp(target_logprobs - sampling_logprobs)
-    clipped_ratio = jnp.clip(prob_ratio, 0.8, 1.2)
+    clipped_ratio = jnp.clip(prob_ratio, clip_low, clip_high)
     unclipped = prob_ratio * advantages
     clipped = clipped_ratio * advantages
     return -safe_loss_mask(jnp.minimum(unclipped, clipped), loss_mask)

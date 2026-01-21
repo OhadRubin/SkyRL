@@ -80,11 +80,17 @@ class TinkerEngine:
         all_sampling_logprobs = []
         all_advantages = []
         all_loss_fn_types = []
+        all_clip_low = []  # TODO: must fix this slop - parallel arrays should be bundled into a single structure
+        all_clip_high = []  # TODO: must fix this slop - parallel arrays should be bundled into a single structure
         request_batch_slices = []
 
         for request_id, (model_id, request_data) in requests.items():
             adapter_index = self.models[model_id].adapter_index
             loss_fn_type = LOSS_TYPES[request_data.loss_fn]
+            # TODO: must fix this slop - dict[str, float] should be a typed config, defaults should not exist
+            config = request_data.loss_fn_config or {}
+            clip_low = config.get("clip_low_threshold", 0.8)
+            clip_high = config.get("clip_high_threshold", 1.2)
 
             request_start = len(all_input_ids)
             for item in request_data.data:
@@ -97,6 +103,8 @@ class TinkerEngine:
                 all_advantages.append(loss_fn_inputs.advantages.data)
                 all_adapter_indices.append(adapter_index)
                 all_loss_fn_types.append(loss_fn_type)
+                all_clip_low.append(clip_low)
+                all_clip_high.append(clip_high)
 
             request_batch_slices.append((request_id, model_id, request_start, len(all_input_ids)))
 
@@ -108,6 +116,8 @@ class TinkerEngine:
             all_advantages=all_advantages,
             all_adapter_indices=all_adapter_indices,
             all_loss_fn_types=all_loss_fn_types,
+            all_clip_low=all_clip_low,
+            all_clip_high=all_clip_high,
             request_batch_slices=request_batch_slices,
         )
 
