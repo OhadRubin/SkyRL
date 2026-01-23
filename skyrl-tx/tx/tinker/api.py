@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.exc import IntegrityError, TimeoutError as SATimeoutError
 import asyncio
 import subprocess
@@ -40,6 +41,23 @@ ID_MAX_LENGTH = 255
 MAX_SAMPLER_CHECKPOINTS_PER_MODEL = 3
 
 _last_cache_stats_log_time: float = 0
+
+FULFILLED_CLEANUP_INTERVAL_SECONDS = 600
+
+
+async def _cleanup_fulfilled_futures(app: FastAPI):
+    """Periodically delete fulfilled futures from the database."""
+    while True:
+        await asyncio.sleep(FULFILLED_CLEANUP_INTERVAL_SECONDS)
+        try:
+            async with AsyncSession(app.state.db_engine) as session:
+                stmt = sa_delete(FutureDB).where(FutureDB.fulfilled == True)
+                result = await session.exec(stmt)
+                await session.commit()
+                if result.rowcount > 0:
+                    logger.info(f"Cleaned up {result.rowcount} fulfilled futures")
+        except Exception as e:
+            logger.warning(f"Failed to clean up fulfilled futures: {e}")
 
 
 @asynccontextmanager
@@ -76,8 +94,11 @@ async def lifespan(app: FastAPI):
     background_engine = subprocess.Popen(cmd)
     logger.info(f"Started background engine with PID {background_engine.pid}: {' '.join(cmd)}")
 
+    cleanup_task = asyncio.create_task(_cleanup_fulfilled_futures(app))
+
     yield
 
+    cleanup_task.cancel()
     logger.info(f"Stopping background engine (PID {background_engine.pid})")
     background_engine.terminate()
     try:
@@ -958,13 +979,24 @@ async def retrieve_future(request: RetrieveFutureRequest, req: Request):
                     result = await session.exec(statement)
                     future = result.first()
 
+                    result_data = future.result_data
+                    should_fulfill = future.request_type in (
+                        types.RequestType.FORWARD,
+                        types.RequestType.FORWARD_BACKWARD,
+                        types.RequestType.SAMPLE,
+                        types.RequestType.EXTERNAL,
+                    )
+
+                    if should_fulfill:
+                        future.fulfilled = True
+                        await session.commit()
+
                     if future.status == RequestStatus.COMPLETED:
-                        return future.result_data
+                        return result_data
 
                     if future.status == RequestStatus.FAILED:
-                        # Return 400 for handled errors (validation, etc.), 500 for unexpected failures
-                        if future.result_data and "error" in future.result_data:
-                            raise HTTPException(status_code=400, detail=future.result_data["error"])
+                        if result_data and "error" in result_data:
+                            raise HTTPException(status_code=400, detail=result_data["error"])
                         else:
                             raise HTTPException(status_code=500, detail="Unknown error")
         except SATimeoutError:

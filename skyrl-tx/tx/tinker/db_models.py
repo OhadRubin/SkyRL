@@ -74,6 +74,7 @@ class FutureDB(SQLModel, table=True):
     request_data: dict = Field(sa_type=JSON)  # this is of type types.{request_type}Input
     result_data: dict | None = Field(default=None, sa_type=JSON)  # this is of type types.{request_type}Output
     status: RequestStatus = Field(default=RequestStatus.PENDING, index=True)
+    fulfilled: bool = Field(default=False, index=True)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), sa_type=DateTime(timezone=True))
     completed_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
 
