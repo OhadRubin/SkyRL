@@ -991,10 +991,10 @@ async def retrieve_future(request: RetrieveFutureRequest, req: Request):
                         future.fulfilled = True
                         await session.commit()
 
-                    if future.status == RequestStatus.COMPLETED:
+                    if status == RequestStatus.COMPLETED:
                         return result_data
 
-                    if future.status == RequestStatus.FAILED:
+                    if status == RequestStatus.FAILED:
                         if result_data and "error" in result_data:
                             raise HTTPException(status_code=400, detail=result_data["error"])
                         else:
