@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 from flax.linen import partitioning as nn_partitioning
+from flax.training import checkpoints
 
 from tx.tinker import types
 from tx.tinker.config import EngineConfig
@@ -290,7 +291,8 @@ class MaxTextBackend(AbstractBackend):
         Creates optimizer for the model. MaxText is single-adapter so adapter_index is ignored.
         """
         tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.0)
-        self.optimizers[model_id] = nnx.Optimizer(self.model, tx, wrt=self.lora_filter)
+        with jax.set_mesh(self.mesh):
+            self.optimizers[model_id] = nnx.Optimizer(self.model, tx, wrt=self.lora_filter)
         logger.info(f"Registered model {model_id} with MaxText backend")
 
     def unregister_model(self, model_id: str, adapter_index: int) -> None:
@@ -657,26 +659,37 @@ class MaxTextBackend(AbstractBackend):
         model_id: str,
         models: dict[str, types.ModelMetadata],
     ) -> None:
-        """Save training checkpoint in HuggingFace PEFT format as tar.gz."""
+        """Save training checkpoint as tar.gz to GCS.
+
+        Serialization: flax.training.checkpoints (msgpack).
+        Produces a file "checkpoint_0" inside a tar.gz at output_path.
+        Contents: {lora_weights: jax arrays, optimizer_state: nnx.State leaves, lora_config: dict}.
+        """
         with pack_and_upload(output_path) as temp_dir:
-            convert_maxtext_lora_to_hf(
-                lora_state=self.lora_params,
-                output_path=temp_dir,
-                base_model_name=self.config.base_model,
-                lora_rank=self.maxtext_config.lora_rank,
-                lora_alpha=self.maxtext_config.lora_alpha,
+            checkpoint_data = self.extract_checkpoint_data(model_id, models)
+            checkpoints.save_checkpoint(
+                target=checkpoint_data,
+                ckpt_dir=temp_dir,
+                step=0,
+                prefix="checkpoint_",
+                overwrite=True,
             )
-        logger.info(f"Saved MaxText training checkpoint to {output_path}")
+            logger.info(f"Saved MaxText training checkpoint of {model_id} to {str(output_path)}")
 
     def extract_checkpoint_data(
         self,
         model_id: str,
         models: dict[str, types.ModelMetadata],
     ) -> dict:
-        """Extract LoRA state and optimizer state for checkpointing.
+        """Extract LoRA weights + optimizer state as a plain dict for serialization.
 
-        Creates copies of the arrays to ensure the cached state is independent
-        from the live model state (which may be zeroed on eviction).
+        Returns a dict compatible with flax.training.checkpoints.save_checkpoint:
+        - "lora_weights": copied jax arrays (tree structure mirrors self.lora_params)
+        - "optimizer_state": copied nnx.State leaves (tree structure mirrors nnx.state(optimizer))
+        - "lora_config": plain python dict from pydantic model_dump()
+
+        Arrays are copied so the checkpoint is independent from live state (which gets zeroed on eviction).
+        Also used as the `target` shape reference for restore_checkpoint on the load path.
         """
         # Copy arrays to avoid caching references that get zeroed
         lora_weights_copy = jax.tree.map(jnp.copy, self.lora_params)
@@ -693,9 +706,12 @@ class MaxTextBackend(AbstractBackend):
         checkpoint_data: dict,
         models: dict[str, types.ModelMetadata],
     ) -> None:
-        """Insert checkpoint data into model state.
+        """Load checkpoint data into live model state.
 
-        Reshards the cached arrays to match the current model's sharding.
+        checkpoint_data leaves are numpy arrays (from msgpack deserialization via
+        flax.training.checkpoints.restore_checkpoint) or jax arrays (from in-memory cache).
+        Each leaf is resharded via jax.device_put to match the current optimizer/lora sharding,
+        then written in-place via nnx.update.
         """
         optimizer = self.optimizers[model_id]
 
@@ -717,7 +733,7 @@ class MaxTextBackend(AbstractBackend):
         nnx.update(nnx.state(optimizer), resharded_optim)
         # Sync model with updated lora_params
         self.model = nnx.merge(self.graphdef, self.lora_params, self.non_lora_params)
-        logger.info(f"Restored checkpoint data for model {model_id}")
+        logger.info(f"Restored checkpoint data for model {model_id} ")
 
     def save_sampler_checkpoint(
         self,
@@ -734,7 +750,7 @@ class MaxTextBackend(AbstractBackend):
                 lora_rank=self.maxtext_config.lora_rank,
                 lora_alpha=self.maxtext_config.lora_alpha,
             )
-        logger.info(f"Saved MaxText LoRA sampler checkpoint to {output_path}")
+        logger.info(f"Saved MaxText LoRA sampler checkpoint of model {model_id} to {str(output_path)}")
 
     def extract_sampler_weights(
         self,

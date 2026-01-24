@@ -16,15 +16,22 @@ def _setup_root_logger() -> None:
     logger = logging.getLogger("tx")
     logger.setLevel(logging.DEBUG)
     logger.propagate = False  # Prevent propagation to root logger
-    console = Console(highlight=True, markup=True)
 
-    class RichStreamHandler(logging.Handler):
-        def emit(self, record):
-            msg = self.format(record)
-            console.print(msg, highlight=True)
+    formatter = logging.Formatter("%(levelname)s: %(filename)s:%(lineno)d %(message)s")
 
-    handler = RichStreamHandler()
-    handler.setFormatter(logging.Formatter("%(levelname)s:     %(message)s"))
+    if os.environ.get("TX_LOG_RICH"):
+        console = Console(highlight=True, markup=True)
+
+        class RichStreamHandler(logging.Handler):
+            def emit(self, record):
+                msg = self.format(record)
+                console.print(msg, highlight=True)
+
+        handler = RichStreamHandler()
+    else:
+        handler = logging.StreamHandler()
+
+    handler.setFormatter(formatter)
     logger.addHandler(handler)
 
 
@@ -32,7 +39,7 @@ def add_file_handler(path: Path | str, level: int = logging.DEBUG, *, print_path
     logger = logging.getLogger("tx")
     handler = logging.FileHandler(path)
     handler.setLevel(level)
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    formatter = logging.Formatter("%(asctime)s - %(filename)s:%(lineno)d - %(levelname)s - %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     if print_path:
