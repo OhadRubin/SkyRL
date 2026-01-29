@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy import delete as sa_delete
+from sqlalchemy import delete as sa_delete, text
 from sqlalchemy.exc import IntegrityError, TimeoutError as SATimeoutError
 import asyncio
 import subprocess
@@ -71,9 +71,11 @@ async def lifespan(app: FastAPI):
         pool_size=20,
         max_overflow=40,
         pool_timeout=60,
+        connect_args={"timeout": 60},
     )
 
     async with app.state.db_engine.begin() as conn:
+        await conn.execute(text("PRAGMA journal_mode=WAL"))
         await conn.run_sync(SQLModel.metadata.create_all)
 
     # Setup external inference client if configured
