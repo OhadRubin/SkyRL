@@ -1,3 +1,4 @@
+from observability import log, bootstrap, set_run_id, Events
 from enum import Enum
 import logging
 import os
@@ -43,7 +44,7 @@ def add_file_handler(path: Path | str, level: int = logging.DEBUG, *, print_path
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     if print_path:
-        print(f"Logging to '{path}'")
+        log.info("logging to file", component="log", path=str(path))
 
 
 _setup_root_logger()
@@ -57,15 +58,11 @@ class ExperimentTracker(str, Enum):
 class Tracker:
 
     def __init__(self, config: dict[str, Any], **kwargs):
-        logger.info(f"model config: {config}")
+        log.info("initialized tracker", component="tracker", config=config)
 
     def log(self, metrics: dict[str, Any], step: int | None = None) -> None:
         data = metrics if step is None else {"step": step, **metrics}
-        logger.info(
-            ", ".join(
-                f"{key}: {value:.3e}" if isinstance(value, float) else f"{key}: {value}" for key, value in data.items()
-            )
-        )
+        log.info("logged metrics", component="tracker", **data)
 
 
 class WandbTracker(Tracker):

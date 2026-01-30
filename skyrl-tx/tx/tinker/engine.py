@@ -19,7 +19,7 @@ from tx.tinker.backends import NativeBackend, MaxTextBackend, parse_maxtext_conf
 from tx.tinker.backends.utils import log_timing
 from tx.tinker.loss_fns import LOSS_TYPES
 from tx.utils.storage import download_and_unpack
-from tx.utils.log import logger
+from observability import log, bootstrap, set_run_id, Events
 
 
 class TinkerEngine:
@@ -190,9 +190,12 @@ class TinkerEngine:
         else:
             self.backend = NativeBackend(config)
 
-        logger.info(
-            f"Initialized TinkerEngine with backend={type(self.backend).__name__}, "
-            f"max_lora_adapters={config.max_lora_adapters}, max_lora_rank={config.max_lora_rank}"
+        log.info(
+            "initialized",
+            component="tinker-engine",
+            backend=type(self.backend).__name__,
+            max_lora_adapters=config.max_lora_adapters,
+            max_lora_rank=config.max_lora_rank,
         )
 
     @property
@@ -232,11 +235,11 @@ class TinkerEngine:
         if model_id in self.models:
             cached_state = self.backend.extract_checkpoint_data(model_id, self.models)
             self._model_cache[model_id] = cached_state
-            logger.info(f"Cached state for model {model_id}")
+            log.info("cached state", component="tinker-engine", model_id=model_id)
 
         metadata = self.models.pop(model_id)
         self.backend.unregister_model(model_id, metadata.adapter_index)
-        logger.info(f"Evicted model {model_id} (adapter_index={metadata.adapter_index}) to make room for new model")
+        log.info("evicted model", component="tinker-engine", model_id=model_id, adapter_index=metadata.adapter_index)
         return metadata.adapter_index
 
     def _touch_model(self, model_id: str) -> None:
@@ -262,7 +265,7 @@ class TinkerEngine:
                 yield checkpoint_db
                 checkpoint_db.status = CheckpointStatus.COMPLETED
             except Exception as e:
-                logger.exception(f"Error saving checkpoint for model {model_id}, checkpoint {checkpoint_id}: {e}")
+                log.exception("error saving checkpoint", component="tinker-engine", model_id=model_id, checkpoint_id=checkpoint_id, error=str(e))
                 checkpoint_db.status = CheckpointStatus.FAILED
                 checkpoint_db.error_message = str(e)
                 raise
@@ -411,14 +414,24 @@ class TinkerEngine:
             cached_rank = cached_state["lora_config"]["rank"]
             if cached_rank == lora_config.rank:
                 self.backend.insert_checkpoint_data(model_id, cached_state, self.models)
-                logger.info(f"Restored cached state for model {model_id}")
+                log.info("restored cached state", component="tinker-engine", model_id=model_id)
             else:
-                logger.info(
-                    f"Skipped cache restore for {model_id}: rank mismatch "
-                    f"(cached={cached_rank}, requested={lora_config.rank})"
+                log.info(
+                    "skipped cache restore due to rank mismatch",
+                    component="tinker-engine",
+                    model_id=model_id,
+                    cached_rank=cached_rank,
+                    requested_rank=lora_config.rank,
                 )
 
-        logger.info(f"Created LoRA model {model_id} with adapter index {adapter_index}, config {lora_config}")
+        log.info(
+            "created lora model",
+            component="tinker-engine",
+            model_id=model_id,
+            adapter_index=adapter_index,
+            lora_rank=lora_config.rank,
+            lora_alpha=lora_config.alpha,
+        )
 
         return types.CreateModelOutput(
             model_id=model_id,
@@ -535,7 +548,7 @@ class TinkerEngine:
         # Insert checkpoint data into model state via backend
         self.backend.insert_checkpoint_data(model_id, checkpoint, self.models)
 
-        logger.info(f"Loaded training checkpoint for model {model_id} from {checkpoint_dir}")
+        log.info("loaded training checkpoint", component="tinker-engine", model_id=model_id, checkpoint_dir=str(checkpoint_dir))
         return types.LoadWeightsOutput(type="load_weights")
 
     def process_save_weights(self, model_id: str, request_data: types.SaveWeightsInput) -> types.SaveWeightsOutput:
@@ -552,7 +565,7 @@ class TinkerEngine:
 
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
             self.backend.save_checkpoint(output_path, model_id, self.models)
-            logger.info(f"Saved trimmed training checkpoint for model {model_id} to {output_path}")
+            log.info("saved training checkpoint", component="tinker-engine", model_id=model_id, output_path=str(output_path))
 
         return types.SaveWeightsOutput(
             path=f"tinker://{model_id}/weights/{checkpoint_id}",
@@ -576,8 +589,12 @@ class TinkerEngine:
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
             self.backend.save_sampler_checkpoint(output_path, model_id, self.models)
 
-            logger.info(
-                f"Saved LoRA adapter weights for model {model_id} (adapter {lora_model.adapter_index}) to {output_path}"
+            log.info(
+                "saved lora adapter weights",
+                component="tinker-engine",
+                model_id=model_id,
+                adapter_index=lora_model.adapter_index,
+                output_path=str(output_path),
             )
 
         return types.SaveWeightsForSamplerOutput(
@@ -616,7 +633,7 @@ class TinkerEngine:
                     checkpoint_path = (
                         self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
                     )
-                    logger.info(f"Loading LoRA sampler checkpoint from {checkpoint_path}")
+                    log.info("loading lora sampler checkpoint", component="tinker-engine", checkpoint_path=str(checkpoint_path))
 
                     # Use backend to insert sampler weights
                     self.backend.insert_sampler_weights(model_id, checkpoint_id, checkpoint_path, self.models)
@@ -684,7 +701,7 @@ class TinkerEngine:
                 try:
                     result = self.process_single_request(request_type, model_id, request_data)
                 except Exception as e:
-                    logger.exception(f"Error processing request {request_id}: {e}")
+                    log.exception("error processing request", component="tinker-engine", request_id=request_id, error=str(e))
                     result = types.ErrorResponse(error=str(e), status="failed")
             results[request_id] = result
         self._complete_futures(results)
@@ -702,7 +719,7 @@ class TinkerEngine:
             try:
                 results = batch_processor(requests)
             except Exception as e:
-                logger.exception(f"Error processing batch: {e}")
+                log.exception("error processing batch", component="tinker-engine", processor=batch_processor.__name__, error=str(e))
                 results = {request_id: types.ErrorResponse(error=str(e), status="failed") for request_id in requests}
         self._complete_futures(results)
 
@@ -734,7 +751,7 @@ class TinkerEngine:
 
     def run(self):
         """Entry point to start the engine."""
-        logger.info("Starting background engine...")
+        log.info("starting background engine", component="tinker-engine")
         self.process_pending_requests()
 
 

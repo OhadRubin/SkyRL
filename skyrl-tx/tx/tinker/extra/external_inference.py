@@ -1,15 +1,18 @@
 import asyncio
 import shutil
+import sys
 
 import httpx
 from tenacity import retry, stop_after_attempt, retry_if_exception_type
 from datetime import datetime, timezone
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+
+from observability import log, bootstrap, set_run_id, Events
+
 from tx.tinker import types
 from tx.tinker.config import EngineConfig
 from tx.tinker.db_models import FutureDB, RequestStatus
-from tx.utils.log import logger
 from tx.utils.storage import download_and_unpack
 
 
@@ -64,14 +67,14 @@ class ExternalInferenceClient:
         elapsed = (datetime.now(timezone.utc) - marked_at).total_seconds()
         if elapsed >= UNHEALTHY_DURATION_SECONDS:
             del self._unhealthy_urls[url]
-            logger.info(f"URL {url} recovered after {elapsed:.1f}s unhealthy period")
+            log.info("url recovered", component="external_inference", url=url, elapsed_s=round(elapsed, 1))
             return True
         return False
 
     def _mark_url_unhealthy(self, url: str):
         """Mark URL as unhealthy for UNHEALTHY_DURATION_SECONDS."""
         self._unhealthy_urls[url] = datetime.now(timezone.utc)
-        logger.warning(f"Marked {url} as unhealthy for {UNHEALTHY_DURATION_SECONDS}s")
+        log.warning("marked url unhealthy", component="external_inference", url=url, duration_s=UNHEALTHY_DURATION_SECONDS)
 
     def _seconds_until_any_healthy(self) -> float | None:
         """Return seconds until the earliest unhealthy URL recovers, or None if any URL is already healthy."""
@@ -195,13 +198,13 @@ class ExternalInferenceClient:
                             self._prefix_to_server[h] = base_url
                         return result
                     except httpx.HTTPStatusError as e:
-                        logger.warning(f"Server {base_url} failed with HTTP {e.response.status_code}, trying next: {e}")
+                        log.warning("server failed with http error", component="external_inference", url=base_url, status_code=e.response.status_code, error=str(e))
                         last_error = e
                         if e.response.status_code >= 500:
                             self._mark_url_unhealthy(base_url)
                         continue
                     except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException) as e:
-                        logger.warning(f"Server {base_url} failed, trying next: {e}")
+                        log.warning("server connection failed", component="external_inference", url=base_url, error=str(e))
                         last_error = e
                         is_timeout_error = isinstance(e, httpx.TimeoutException)
                         self._mark_url_unhealthy(base_url)
@@ -213,7 +216,7 @@ class ExternalInferenceClient:
                         f"All {len(self.base_urls)} servers failed, last error: {last_error}",
                         is_timeout=is_timeout_error,
                     )
-                logger.info(f"All servers unhealthy, waiting {wait_seconds:.1f}s for recovery")
+                log.info("all servers unhealthy, waiting for recovery", component="external_inference", wait_s=round(wait_seconds, 1))
                 await asyncio.sleep(wait_seconds + 0.1)
 
         try:
@@ -221,12 +224,12 @@ class ExternalInferenceClient:
             result_data = result.model_dump()
             status = RequestStatus.COMPLETED
         except AllServersFailed as e:
-            logger.exception(f"All external engines failed after retries")
+            log.error("all external engines failed after retries", component="external_inference", error=str(e))
             error_msg = f"{TIMEOUT_ERROR_PREFIX}{e}" if e.is_timeout else str(e)
             result_data = {"error": error_msg, "status": "failed"}
             status = RequestStatus.FAILED
         except Exception as e:
-            logger.exception(f"Unexpected error in external inference")
+            log.error("unexpected error in external inference", component="external_inference", error=str(e))
             result_data = {"error": str(e), "status": "failed"}
             status = RequestStatus.FAILED
 

@@ -30,7 +30,7 @@ from tx.tinker.db_models import (
 )
 from tx.tinker.extra import ExternalInferenceClient
 from tx.utils.storage import download_file
-from tx.utils.log import logger
+from observability import log, bootstrap, set_run_id, Events
 
 # Validation patterns for train_run_ids, model_ids and checkpoint_ids
 ID_PATTERN = r"^[a-zA-Z0-9_-]+$"
@@ -55,9 +55,9 @@ async def _cleanup_fulfilled_futures(app: FastAPI):
                 result = await session.exec(stmt)
                 await session.commit()
                 if result.rowcount > 0:
-                    logger.info(f"Cleaned up {result.rowcount} fulfilled futures")
+                    log.info("cleaned up fulfilled futures", component="cleanup", count=result.rowcount)
         except Exception as e:
-            logger.warning(f"Failed to clean up fulfilled futures: {e}")
+            log.warning("failed to clean up fulfilled futures", component="cleanup", error=str(e))
 
 
 @asynccontextmanager
@@ -81,10 +81,10 @@ async def lifespan(app: FastAPI):
     # Setup external inference client if configured
     if app.state.engine_config.external_inference_urls:
         app.state.external_inference_client = ExternalInferenceClient(app.state.engine_config, app.state.db_engine)
-        logger.info(f"External engines configured: {app.state.engine_config.external_inference_urls}")
+        log.info("external engines configured", component="lifespan", urls=app.state.engine_config.external_inference_urls)
     else:
         app.state.external_inference_client = None
-        logger.info("Using internal engine for inference")
+        log.info("using internal engine for inference", component="lifespan")
 
     # Build subprocess command with engine config parameters
     cmd = ["uv", "run", "--no-sync", "--extra", "tinker"]
@@ -94,22 +94,22 @@ async def lifespan(app: FastAPI):
     cmd.extend(config_to_argv(app.state.engine_config))
 
     background_engine = subprocess.Popen(cmd)
-    logger.info(f"Started background engine with PID {background_engine.pid}: {' '.join(cmd)}")
+    log.info("started background engine", component="lifespan", pid=background_engine.pid, cmd=" ".join(cmd))
 
     cleanup_task = asyncio.create_task(_cleanup_fulfilled_futures(app))
 
     yield
 
     cleanup_task.cancel()
-    logger.info(f"Stopping background engine (PID {background_engine.pid})")
+    log.info("stopping background engine", component="lifespan", pid=background_engine.pid)
     background_engine.terminate()
     try:
         background_engine.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        logger.warning(f"Background engine (PID {background_engine.pid}) did not terminate gracefully, killing")
+        log.warning("background engine did not terminate gracefully, killing", component="lifespan", pid=background_engine.pid)
         background_engine.kill()
         background_engine.wait()
-    logger.info("Background engine stopped")
+    log.info("background engine stopped", component="lifespan")
 
 
 app = FastAPI(title="Tinker API Mock", version="0.0.1", lifespan=lifespan)
@@ -243,9 +243,9 @@ async def evict_old_sampler_checkpoints(
             try:
                 if checkpoint_path.exists():
                     checkpoint_path.unlink()
-                    logger.info(f"Deleted sampler checkpoint file: {checkpoint_path}")
+                    log.info("deleted sampler checkpoint file", component="checkpoint", path=str(checkpoint_path))
             except Exception as e:
-                logger.warning(f"Failed to delete checkpoint file {checkpoint_path}: {e}")
+                log.warning("failed to delete checkpoint file", component="checkpoint", path=str(checkpoint_path), error=str(e))
 
             # Delete extracted lora directory (used by external inference / vLLM)
             if engine_config.external_inference_lora_base:
@@ -253,13 +253,13 @@ async def evict_old_sampler_checkpoints(
                 try:
                     if lora_dir.exists():
                         shutil.rmtree(lora_dir)
-                        logger.info(f"Deleted extracted lora directory: {lora_dir}")
+                        log.info("deleted extracted lora directory", component="checkpoint", path=str(lora_dir))
                 except Exception as e:
-                    logger.warning(f"Failed to delete lora directory {lora_dir}: {e}")
+                    log.warning("failed to delete lora directory", component="checkpoint", path=str(lora_dir), error=str(e))
 
             # Delete from database
             await session.delete(checkpoint)
-            logger.info(f"Evicted sampler checkpoint: {model_id}/{checkpoint_id}")
+            log.info("evicted sampler checkpoint", component="checkpoint", model_id=model_id, checkpoint_id=checkpoint_id)
 
         await session.flush()
 
@@ -935,7 +935,7 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         global _last_cache_stats_log_time
         now = time.time()
         if now - _last_cache_stats_log_time >= 5:
-            logger.info(f"KV cache affinity stats: {req.app.state.external_inference_client.cache_stats}")
+            log.info("kv cache affinity stats", component="external_inference", cache_stats=req.app.state.external_inference_client.cache_stats)
             _last_cache_stats_log_time = now
 
     return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
@@ -1172,6 +1172,8 @@ async def root():
 if __name__ == "__main__":
     import argparse
     import uvicorn
+
+    bootstrap("tinker-api")
 
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="SkyRL tx tinker API server")

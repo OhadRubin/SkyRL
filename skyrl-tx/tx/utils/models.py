@@ -16,7 +16,7 @@ import safetensors.numpy
 from transformers import PretrainedConfig
 import peft
 
-from tx.utils.log import logger
+from observability import log, bootstrap, set_run_id, Events
 from tx.utils.storage import download_and_unpack, pack_and_upload
 from tx.tinker.types import LoraConfig
 
@@ -39,7 +39,7 @@ def resolve_model_path(model_name_or_path: str) -> str:
     """
     local_path = Path(model_name_or_path).expanduser()
     if local_path.is_dir():
-        logger.info(f"Using local model at {local_path}")
+        log.info("using local model", component="models", path=str(local_path))
         return str(local_path)
     return snapshot_download(model_name_or_path, allow_patterns=["*.safetensors", "*.json"])
 
@@ -336,7 +336,7 @@ def convert_maxtext_lora_to_hf(
     if num_layers is None:
         raise ValueError("Could not determine num_layers from tensor shapes")
 
-    logger.info(f"Converting MaxText LoRA to HuggingFace format: {num_layers} layers, rank={lora_rank}")
+    log.info("converting maxtext lora to huggingface format", component="models", num_layers=num_layers, rank=lora_rank)
 
     # Output tensors in HuggingFace format
     hf_tensors = {}
@@ -356,10 +356,10 @@ def convert_maxtext_lora_to_hf(
                 lora_type = "lora_A" if part == "lora_a" else "lora_B"
 
         if proj_name is None or lora_type is None:
-            logger.warning(f"Skipping unrecognized path: {path_str}")
+            log.warning("skipping unrecognized path", component="models", path=path_str)
             continue
 
-        logger.info(f"Converting {path_str}: shape {tensor.shape} -> {proj_name}/{lora_type}")
+        log.info("converting tensor", component="models", path=path_str, shape=list(tensor.shape), proj_name=proj_name, lora_type=lora_type)
 
         # Convert based on projection and lora type
         # MaxText shapes vary, need to handle each case
@@ -401,7 +401,7 @@ def convert_maxtext_lora_to_hf(
     output_path.mkdir(parents=True, exist_ok=True)
 
     safetensors.numpy.save_file(hf_tensors, output_path / "adapter_model.safetensors")
-    logger.info(f"Saved {len(hf_tensors)} tensors to {output_path / 'adapter_model.safetensors'}")
+    log.info("saved tensors", component="models", num_tensors=len(hf_tensors), path=str(output_path / "adapter_model.safetensors"))
 
     # Save PEFT config
     peft_config = peft.LoraConfig(
@@ -411,7 +411,7 @@ def convert_maxtext_lora_to_hf(
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     )
     peft_config.save_pretrained(output_path)
-    logger.info(f"Saved PEFT config to {output_path}")
+    log.info("saved peft config", component="models", path=str(output_path))
 
 
 def round_up_seq_len(seq_len: int, min_seq_len: int = 32) -> int:

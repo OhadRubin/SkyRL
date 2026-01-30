@@ -37,7 +37,7 @@ from tx.utils.models import (
     resolve_model_path,
 )
 from tx.utils.storage import pack_and_upload
-from tx.utils.log import logger
+from observability import log, bootstrap, set_run_id, Events
 
 
 @jax.tree_util.register_dataclass
@@ -134,9 +134,12 @@ class NativeBackend(AbstractBackend):
         # Per-model optimizer storage (managed internally)
         self.optimizers: dict[str, nnx.Optimizer] = {}
 
-        logger.info(
-            f"Initialized base model {config.base_model} with "
-            f"max_lora_adapters={config.max_lora_adapters}, max_lora_rank={config.max_lora_rank}"
+        log.info(
+            "initialized base model",
+            component="native_backend",
+            base_model=config.base_model,
+            max_lora_adapters=config.max_lora_adapters,
+            max_lora_rank=config.max_lora_rank,
         )
 
         self._create_loss_and_grad_fn()
@@ -160,12 +163,12 @@ class NativeBackend(AbstractBackend):
             else self.metrics.sample_seq_len_jit_times
         )
         if not self.config.enforce_eager and seq_len not in jit_times:
-            logger.info(f"JIT compiling for {mode} seq_len={seq_len} in progress...")
+            log.info("jit compiling in progress", component="native_backend", mode=mode, seq_len=seq_len)
             start_time = time.time()
             yield
             elapsed = time.time() - start_time
             jit_times[seq_len] = elapsed
-            logger.info(f"JIT compilation for {mode} seq_len={seq_len} took {elapsed:.2f}s")
+            log.info("jit compilation complete", component="native_backend", mode=mode, seq_len=seq_len, elapsed_s=round(elapsed, 2))
         else:
             yield
 
@@ -353,7 +356,7 @@ class NativeBackend(AbstractBackend):
 
         # Configure adapter
         update_adapter_config(self.model, adapter_index, lora_config)
-        logger.info(f"Registered model {model_id} with adapter_index={adapter_index}")
+        log.info("registered model", component="native_backend", model_id=model_id, adapter_index=adapter_index)
 
     def unregister_model(self, model_id: str, adapter_index: int) -> None:
         """Unregister a model from the backend.
@@ -371,7 +374,7 @@ class NativeBackend(AbstractBackend):
 
         updated_params = jax.tree.map_with_path(zero_adapter_slice, self.lora_params)
         nnx.update(self.lora_params, updated_params)
-        logger.info(f"Unregistered model {model_id} (adapter_index={adapter_index})")
+        log.info("unregistered model", component="native_backend", model_id=model_id, adapter_index=adapter_index)
 
     def _process_model_pass_batch(
         self,
@@ -514,7 +517,7 @@ class NativeBackend(AbstractBackend):
 
         # Check if we have any gradients accumulated (count > 0)
         if self.accumulated_grads.counts[adapter_index] == 0:
-            logger.warning(f"No accumulated gradients for model {model_id}, skipping optimizer step")
+            log.warning("no accumulated gradients, skipping optimizer step", component="native_backend", model_id=model_id)
             return types.OptimStepOutput()
 
         # Update hyperparameters from the request
@@ -533,7 +536,7 @@ class NativeBackend(AbstractBackend):
                 adapter_index_arr,
             )
 
-        logger.info(f"Applied optimizer step for model {model_id} (adapter {adapter_index})")
+        log.info("applied optimizer step", component="native_backend", model_id=model_id, adapter_index=adapter_index)
         return types.OptimStepOutput()
 
     def process_sample_batch(
@@ -633,7 +636,7 @@ class NativeBackend(AbstractBackend):
                 prefix="checkpoint_",
                 overwrite=True,
             )
-        logger.info(f"Saved training checkpoint to {output_path}")
+        log.info("saved training checkpoint", component="native_backend", output_path=output_path)
 
     def extract_checkpoint_data(
         self,
@@ -685,7 +688,7 @@ class NativeBackend(AbstractBackend):
             lora_model.adapter_index,
             output_path,
         )
-        logger.info(f"Saved LoRA sampler checkpoint to {output_path}")
+        log.info("saved lora sampler checkpoint", component="native_backend", output_path=output_path)
 
     def extract_sampler_weights(
         self,
@@ -715,4 +718,4 @@ class NativeBackend(AbstractBackend):
         adapter_config = models[model_id].lora_config
         load_lora_checkpoint(self.model, adapter_config, adapter_index, checkpoint_path)
         models[model_id].loaded_checkpoint_id = checkpoint_id
-        logger.info(f"Loaded LoRA sampler weights for model {model_id} at adapter index {adapter_index}")
+        log.info("loaded lora sampler weights", component="native_backend", model_id=model_id, adapter_index=adapter_index)

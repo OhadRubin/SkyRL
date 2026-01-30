@@ -1,12 +1,11 @@
 """Shared helper utilities for TinkerEngine backends."""
+from observability import log, bootstrap, set_run_id, Events
 
 import time
 from contextlib import contextmanager
 
 import numpy as np
 import jax.numpy as jnp
-
-from tx.utils.log import logger
 
 
 @contextmanager
@@ -17,7 +16,7 @@ def log_timing(request: str):
         yield
     finally:
         elapsed = time.perf_counter() - start_time
-        logger.info(f"(timing) {request} took {elapsed:.3f}s")
+        log.info("request completed", component="timing", request=request, elapsed_s=round(elapsed, 3))
 
 
 def pad(xs, pad_to: int, *, fill):
