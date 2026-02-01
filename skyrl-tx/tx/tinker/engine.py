@@ -190,7 +190,7 @@ class TinkerEngine:
         else:
             self.backend = NativeBackend(config)
 
-        log.debug(
+        log.info(
             "initialized",
             component="tinker-engine",
             backend=type(self.backend).__name__,
@@ -235,11 +235,11 @@ class TinkerEngine:
         if model_id in self.models:
             cached_state = self.backend.extract_checkpoint_data(model_id, self.models)
             self._model_cache[model_id] = cached_state
-            log.debug("cached state", component="tinker-engine", model_id=model_id)
+            log.info("cached state", component="tinker-engine", model_id=model_id)
 
         metadata = self.models.pop(model_id)
         self.backend.unregister_model(model_id, metadata.adapter_index)
-        log.debug("evicted model", component="tinker-engine", model_id=model_id, adapter_index=metadata.adapter_index)
+        log.info("evicted model", component="tinker-engine", model_id=model_id, adapter_index=metadata.adapter_index)
         return metadata.adapter_index
 
     def _touch_model(self, model_id: str) -> None:
@@ -414,9 +414,9 @@ class TinkerEngine:
             cached_rank = cached_state["lora_config"]["rank"]
             if cached_rank == lora_config.rank:
                 self.backend.insert_checkpoint_data(model_id, cached_state, self.models)
-                log.debug("restored cached state", component="tinker-engine", model_id=model_id)
+                log.info("restored cached state", component="tinker-engine", model_id=model_id)
             else:
-                log.debug(
+                log.info(
                     "skipped cache restore due to rank mismatch",
                     component="tinker-engine",
                     model_id=model_id,
@@ -424,7 +424,7 @@ class TinkerEngine:
                     requested_rank=lora_config.rank,
                 )
 
-        log.debug(
+        log.info(
             "created lora model",
             component="tinker-engine",
             model_id=model_id,
@@ -548,7 +548,7 @@ class TinkerEngine:
         # Insert checkpoint data into model state via backend
         self.backend.insert_checkpoint_data(model_id, checkpoint, self.models)
 
-        log.debug("loaded training checkpoint", component="tinker-engine", model_id=model_id, checkpoint_dir=str(checkpoint_dir))
+        log.info("loaded training checkpoint", component="tinker-engine", model_id=model_id, checkpoint_dir=str(checkpoint_dir))
         return types.LoadWeightsOutput(type="load_weights")
 
     def process_save_weights(self, model_id: str, request_data: types.SaveWeightsInput) -> types.SaveWeightsOutput:
@@ -565,7 +565,7 @@ class TinkerEngine:
 
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
             self.backend.save_checkpoint(output_path, model_id, self.models)
-            log.debug("saved training checkpoint", component="tinker-engine", model_id=model_id, output_path=str(output_path))
+            log.info("saved training checkpoint", component="tinker-engine", model_id=model_id, output_path=str(output_path))
 
         return types.SaveWeightsOutput(
             path=f"tinker://{model_id}/weights/{checkpoint_id}",
@@ -589,7 +589,7 @@ class TinkerEngine:
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
             self.backend.save_sampler_checkpoint(output_path, model_id, self.models)
 
-            log.debug(
+            log.info(
                 "saved lora adapter weights",
                 component="tinker-engine",
                 model_id=model_id,
@@ -633,7 +633,7 @@ class TinkerEngine:
                     checkpoint_path = (
                         self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
                     )
-                    log.debug("loading lora sampler checkpoint", component="tinker-engine", checkpoint_path=str(checkpoint_path))
+                    log.info("loading lora sampler checkpoint", component="tinker-engine", checkpoint_path=str(checkpoint_path))
 
                     # Use backend to insert sampler weights
                     self.backend.insert_sampler_weights(model_id, checkpoint_id, checkpoint_path, self.models)
@@ -751,7 +751,7 @@ class TinkerEngine:
 
     def run(self):
         """Entry point to start the engine."""
-        log.debug("starting background engine", component="tinker-engine")
+        log.info("starting background engine", component="tinker-engine")
         self.process_pending_requests()
 
 
