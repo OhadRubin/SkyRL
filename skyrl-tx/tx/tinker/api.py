@@ -112,6 +112,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Tinker API Mock", version="0.0.1", lifespan=lifespan)
 
+from observability import configure_uvicorn_access_logs
+configure_uvicorn_access_logs()
+
 
 async def get_session(request: Request) -> AsyncGenerator[AsyncSession, None]:
     """Dependency to get a database session."""
