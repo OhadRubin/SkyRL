@@ -40,8 +40,6 @@ ID_MAX_LENGTH = 255
 # TODO: make this configurable
 MAX_SAMPLER_CHECKPOINTS_PER_MODEL = 3
 
-_last_cache_stats_log_time: float = 0
-
 FULFILLED_CLEANUP_INTERVAL_SECONDS = 600
 
 
@@ -931,12 +929,6 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         asyncio.create_task(
             req.app.state.external_inference_client.call_and_store_result(request_id, request, model_id, checkpoint_id)
         )
-
-        global _last_cache_stats_log_time
-        now = time.time()
-        if now - _last_cache_stats_log_time >= 5:
-            log.info("kv cache affinity stats", component="external_inference", cache_stats=req.app.state.external_inference_client.cache_stats)
-            _last_cache_stats_log_time = now
 
     return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
 
