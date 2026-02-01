@@ -53,7 +53,7 @@ async def _cleanup_fulfilled_futures(app: FastAPI):
                 result = await session.exec(stmt)
                 await session.commit()
                 if result.rowcount > 0:
-                    log.info("cleaned up fulfilled futures", component="cleanup", count=result.rowcount)
+                    log.debug("cleaned up fulfilled futures", component="cleanup", count=result.rowcount)
         except Exception as e:
             log.warning("failed to clean up fulfilled futures", component="cleanup", error=str(e))
 
@@ -79,10 +79,10 @@ async def lifespan(app: FastAPI):
     # Setup external inference client if configured
     if app.state.engine_config.external_inference_urls:
         app.state.external_inference_client = ExternalInferenceClient(app.state.engine_config, app.state.db_engine)
-        log.info("external engines configured", component="lifespan", urls=app.state.engine_config.external_inference_urls)
+        log.debug("external engines configured", component="lifespan", urls=app.state.engine_config.external_inference_urls)
     else:
         app.state.external_inference_client = None
-        log.info("using internal engine for inference", component="lifespan")
+        log.debug("using internal engine for inference", component="lifespan")
 
     # Build subprocess command with engine config parameters
     cmd = ["uv", "run", "--no-sync", "--extra", "tinker"]
@@ -92,14 +92,14 @@ async def lifespan(app: FastAPI):
     cmd.extend(config_to_argv(app.state.engine_config))
 
     background_engine = subprocess.Popen(cmd)
-    log.info("started background engine", component="lifespan", pid=background_engine.pid, cmd=" ".join(cmd))
+    log.debug("started background engine", component="lifespan", pid=background_engine.pid, cmd=" ".join(cmd))
 
     cleanup_task = asyncio.create_task(_cleanup_fulfilled_futures(app))
 
     yield
 
     cleanup_task.cancel()
-    log.info("stopping background engine", component="lifespan", pid=background_engine.pid)
+    log.debug("stopping background engine", component="lifespan", pid=background_engine.pid)
     background_engine.terminate()
     try:
         background_engine.wait(timeout=5)
@@ -107,7 +107,7 @@ async def lifespan(app: FastAPI):
         log.warning("background engine did not terminate gracefully, killing", component="lifespan", pid=background_engine.pid)
         background_engine.kill()
         background_engine.wait()
-    log.info("background engine stopped", component="lifespan")
+    log.debug("background engine stopped", component="lifespan")
 
 
 app = FastAPI(title="Tinker API Mock", version="0.0.1", lifespan=lifespan)
@@ -241,7 +241,7 @@ async def evict_old_sampler_checkpoints(
             try:
                 if checkpoint_path.exists():
                     checkpoint_path.unlink()
-                    log.info("deleted sampler checkpoint file", component="checkpoint", path=str(checkpoint_path))
+                    log.debug("deleted sampler checkpoint file", component="checkpoint", path=str(checkpoint_path))
             except Exception as e:
                 log.warning("failed to delete checkpoint file", component="checkpoint", path=str(checkpoint_path), error=str(e))
 
@@ -251,13 +251,13 @@ async def evict_old_sampler_checkpoints(
                 try:
                     if lora_dir.exists():
                         shutil.rmtree(lora_dir)
-                        log.info("deleted extracted lora directory", component="checkpoint", path=str(lora_dir))
+                        log.debug("deleted extracted lora directory", component="checkpoint", path=str(lora_dir))
                 except Exception as e:
                     log.warning("failed to delete lora directory", component="checkpoint", path=str(lora_dir), error=str(e))
 
             # Delete from database
             await session.delete(checkpoint)
-            log.info("evicted sampler checkpoint", component="checkpoint", model_id=model_id, checkpoint_id=checkpoint_id)
+            log.debug("evicted sampler checkpoint", component="checkpoint", model_id=model_id, checkpoint_id=checkpoint_id)
 
         await session.flush()
 

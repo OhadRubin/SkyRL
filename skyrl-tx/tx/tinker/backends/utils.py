@@ -16,7 +16,7 @@ def log_timing(request: str):
         yield
     finally:
         elapsed = time.perf_counter() - start_time
-        log.info("request completed", component="timing", request=request, elapsed_s=round(elapsed, 3))
+        log.debug("request completed", component="timing", request=request, elapsed_s=round(elapsed, 3))
 
 
 def pad(xs, pad_to: int, *, fill):

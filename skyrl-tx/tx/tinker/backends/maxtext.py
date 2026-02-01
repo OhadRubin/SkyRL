@@ -72,7 +72,7 @@ def parse_maxtext_config(config_str: str):
     if not config_str:
         return None
     config_path = _get_maxtext_base_config_path()
-    log.info("using maxtext config", component="maxtext", config_path=config_path)
+    log.debug("using maxtext config", component="maxtext", config_path=config_path)
     argv = ["", config_path] + config_str.split()
     from MaxText import pyconfig as maxtext_pyconfig
     return maxtext_pyconfig.initialize(argv)
@@ -148,7 +148,7 @@ class MaxTextBackend(AbstractBackend):
         # Create mesh using MaxText's device mesh creation
         devices_array = maxtext_utils.create_device_mesh(maxtext_config)
         self.mesh = jax.sharding.Mesh(devices_array, maxtext_config.mesh_axes)
-        log.info("created mesh", component="maxtext", shape=str(self.mesh.shape), axes=str(self.mesh.axis_names))
+        log.debug("created mesh", component="maxtext", shape=str(self.mesh.shape), axes=str(self.mesh.axis_names))
 
         # Create model using MaxText's model creation
         with jax.set_mesh(self.mesh):
@@ -168,17 +168,17 @@ class MaxTextBackend(AbstractBackend):
         # Per-model optimizer storage (managed internally)
         self.optimizers: dict[str, nnx.Optimizer] = {}
 
-        log.info("initialized model", component="maxtext", context_parallel_size=maxtext_config.context_parallel_size)
+        log.debug("initialized model", component="maxtext", context_parallel_size=maxtext_config.context_parallel_size)
 
         self._create_loss_and_grad_fn()
 
     def _log_accumulated_grads(self):
         """Log accumulated gradient structure."""
         accum_params = _count_params(self.accumulated_grads.grad_sum)
-        log.info("accumulated grads total params", component="maxtext", params_millions=round(accum_params / 1e6, 2))
+        log.debug("accumulated grads total params", component="maxtext", params_millions=round(accum_params / 1e6, 2))
         for path, val in jax.tree_util.tree_leaves_with_path(self.accumulated_grads.grad_sum):
             path_str = "/".join(str(k.key) if hasattr(k, 'key') else str(k) for k in path)
-            log.info("accumulated grad shape", component="maxtext", path=path_str, shape=str(val.shape))
+            log.debug("accumulated grad shape", component="maxtext", path=path_str, shape=str(val.shape))
 
     def _create_loss_and_grad_fn(self):
         """Create loss and gradient functions for MaxText model."""
@@ -264,7 +264,7 @@ class MaxTextBackend(AbstractBackend):
         else:
             self._optim_step = nnx.jit(optim_step)
 
-        log.info("created loss and gradient functions", component="maxtext")
+        log.debug("created loss and gradient functions", component="maxtext")
 
     def _micro_batch_size(self, total: int) -> int:
         """Return effective micro-batch size."""
@@ -276,12 +276,12 @@ class MaxTextBackend(AbstractBackend):
         """Context manager to track JIT compilation times."""
         jit_times = self.metrics.train_seq_len_jit_times if mode == "train" else self.metrics.sample_seq_len_jit_times
         if not self.config.enforce_eager and seq_len not in jit_times:
-            log.info("jit compiling in progress", component="maxtext", mode=mode, seq_len=seq_len)
+            log.debug("jit compiling in progress", component="maxtext", mode=mode, seq_len=seq_len)
             start_time = time.time()
             yield
             elapsed = time.time() - start_time
             jit_times[seq_len] = elapsed
-            log.info("jit compilation complete", component="maxtext", mode=mode, seq_len=seq_len, elapsed_s=round(elapsed, 2))
+            log.debug("jit compilation complete", component="maxtext", mode=mode, seq_len=seq_len, elapsed_s=round(elapsed, 2))
         else:
             yield
 
@@ -293,7 +293,7 @@ class MaxTextBackend(AbstractBackend):
         tx = optax.inject_hyperparams(optax.adamw)(learning_rate=0.0)
         with jax.set_mesh(self.mesh):
             self.optimizers[model_id] = nnx.Optimizer(self.model, tx, wrt=self.lora_filter)
-        log.info("registered model", component="maxtext", model_id=model_id)
+        log.debug("registered model", component="maxtext", model_id=model_id)
 
     def unregister_model(self, model_id: str, adapter_index: int) -> None:
         """Unregister a model from the backend.
@@ -306,14 +306,14 @@ class MaxTextBackend(AbstractBackend):
         reset_adapter_weights(self.model)
         # Re-split to update lora_params reference
         self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, self.lora_filter, ...)
-        log.info("unregistered model", component="maxtext", model_id=model_id)
+        log.debug("unregistered model", component="maxtext", model_id=model_id)
 
     def precompile_kernels(self, seq_lens: list[int]):
         """Precompile JIT kernels for specified sequence lengths."""
         if not seq_lens or self.config.enforce_eager:
             return
 
-        log.info("precompiling jit kernels", component="maxtext", seq_lens=seq_lens)
+        log.debug("precompiling jit kernels", component="maxtext", seq_lens=seq_lens)
         micro_bs = max(1, self.config.train_micro_batch_size) if self.config.train_micro_batch_size > 0 else 1
 
         with jax.set_mesh(self.mesh):
@@ -350,7 +350,7 @@ class MaxTextBackend(AbstractBackend):
 
                 self.accumulated_grads = AccumulatedGradients.create(self.lora_params)
 
-        log.info("precompilation complete", component="maxtext", num_seq_lens=len(seq_lens))
+        log.debug("precompilation complete", component="maxtext", num_seq_lens=len(seq_lens))
 
     def _process_forward_backward_batch(
         self,
@@ -403,7 +403,7 @@ class MaxTextBackend(AbstractBackend):
             clip_low = jnp.pad(clip_low, (0, pad_size), mode='constant', constant_values=0.8)
             clip_high = jnp.pad(clip_high, (0, pad_size), mode='constant', constant_values=1.2)
             batch_size = padded_batch_size
-            log.info("padded batch for fsdp sharding", component="maxtext", original_batch_size=original_batch_size, padded_batch_size=padded_batch_size)
+            log.debug("padded batch for fsdp sharding", component="maxtext", original_batch_size=original_batch_size, padded_batch_size=padded_batch_size)
 
         positions = jnp.broadcast_to(jnp.arange(seq_len), (batch_size, seq_len))
         seq_lens = [len(seq) for seq in all_input_ids]
@@ -419,7 +419,7 @@ class MaxTextBackend(AbstractBackend):
             with self._jit_timing_context(seq_len, mode="train"):
                 for mb_start in range(0, total_bs, micro_bs):
                     mb_end = min(mb_start + micro_bs, total_bs)
-                    log.info("forward-backward batch", component="maxtext", mb_start=mb_start, mb_end=mb_end, seq_len=seq_len)
+                    log.debug("forward-backward batch", component="maxtext", mb_start=mb_start, mb_end=mb_end, seq_len=seq_len)
                     tic = time.time()
 
                     mb_input_ids = jax.device_put(input_ids[mb_start:mb_end], data_sharding)
@@ -450,7 +450,7 @@ class MaxTextBackend(AbstractBackend):
                     took = time.time() - tic
                     tokens_processed = (mb_end - mb_start) * seq_len
                     tokens_per_sec = tokens_processed / took if took > 0 else float('nan')
-                    log.info("forward-backward complete", component="maxtext", mb_start=mb_start, mb_end=mb_end, elapsed_s=round(took, 3), tokens_per_sec=round(tokens_per_sec, 1))
+                    log.debug("forward-backward complete", component="maxtext", mb_start=mb_start, mb_end=mb_end, elapsed_s=round(took, 3), tokens_per_sec=round(tokens_per_sec, 1))
 
                     micro_batch_size = mb_end - mb_start
                     self.accumulated_grads = self.accumulated_grads.add(grads, micro_batch_size)
@@ -576,7 +576,7 @@ class MaxTextBackend(AbstractBackend):
 
         if len(buckets) > 1:
             bucket_sizes = {k: len(v[0].all_input_ids) for k, v in buckets.items()}
-            log.info("split batch into buckets", component="maxtext", num_buckets=len(buckets), bucket_sizes=bucket_sizes)
+            log.debug("split batch into buckets", component="maxtext", num_buckets=len(buckets), bucket_sizes=bucket_sizes)
 
         # Collect per-sequence outputs indexed by original sequence index
         per_seq_outputs: dict[int, dict] = {}
@@ -635,7 +635,7 @@ class MaxTextBackend(AbstractBackend):
             self._optim_step(self.model, optimizer, mean_grads)
 
         self.accumulated_grads = self.accumulated_grads.reset()
-        log.info("applied optimizer step", component="maxtext", model_id=model_id)
+        log.debug("applied optimizer step", component="maxtext", model_id=model_id)
 
         return types.OptimStepOutput()
 
@@ -674,7 +674,7 @@ class MaxTextBackend(AbstractBackend):
                 prefix="checkpoint_",
                 overwrite=True,
             )
-            log.info("saved training checkpoint", component="maxtext", model_id=model_id, output_path=str(output_path))
+            log.debug("saved training checkpoint", component="maxtext", model_id=model_id, output_path=str(output_path))
 
     def extract_checkpoint_data(
         self,
@@ -733,7 +733,7 @@ class MaxTextBackend(AbstractBackend):
         nnx.update(nnx.state(optimizer), resharded_optim)
         # Sync model with updated lora_params
         self.model = nnx.merge(self.graphdef, self.lora_params, self.non_lora_params)
-        log.info("restored checkpoint data", component="maxtext", model_id=model_id)
+        log.debug("restored checkpoint data", component="maxtext", model_id=model_id)
 
     def save_sampler_checkpoint(
         self,
@@ -750,7 +750,7 @@ class MaxTextBackend(AbstractBackend):
                 lora_rank=self.maxtext_config.lora_rank,
                 lora_alpha=self.maxtext_config.lora_alpha,
             )
-        log.info("saved lora sampler checkpoint", component="maxtext", model_id=model_id, output_path=str(output_path))
+        log.debug("saved lora sampler checkpoint", component="maxtext", model_id=model_id, output_path=str(output_path))
 
     def extract_sampler_weights(
         self,

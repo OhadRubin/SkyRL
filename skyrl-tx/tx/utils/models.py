@@ -39,7 +39,7 @@ def resolve_model_path(model_name_or_path: str) -> str:
     """
     local_path = Path(model_name_or_path).expanduser()
     if local_path.is_dir():
-        log.info("using local model", component="models", path=str(local_path))
+        log.debug("using local model", component="models", path=str(local_path))
         return str(local_path)
     return snapshot_download(model_name_or_path, allow_patterns=["*.safetensors", "*.json"])
 
@@ -336,7 +336,7 @@ def convert_maxtext_lora_to_hf(
     if num_layers is None:
         raise ValueError("Could not determine num_layers from tensor shapes")
 
-    log.info("converting maxtext lora to huggingface format", component="models", num_layers=num_layers, rank=lora_rank)
+    log.debug("converting maxtext lora to huggingface format", component="models", num_layers=num_layers, rank=lora_rank)
 
     # Output tensors in HuggingFace format
     hf_tensors = {}
@@ -359,7 +359,7 @@ def convert_maxtext_lora_to_hf(
             log.warning("skipping unrecognized path", component="models", path=path_str)
             continue
 
-        log.info("converting tensor", component="models", path=path_str, shape=list(tensor.shape), proj_name=proj_name, lora_type=lora_type)
+        log.debug("converting tensor", component="models", path=path_str, shape=list(tensor.shape), proj_name=proj_name, lora_type=lora_type)
 
         # Convert based on projection and lora type
         # MaxText shapes vary, need to handle each case
@@ -401,7 +401,7 @@ def convert_maxtext_lora_to_hf(
     output_path.mkdir(parents=True, exist_ok=True)
 
     safetensors.numpy.save_file(hf_tensors, output_path / "adapter_model.safetensors")
-    log.info("saved tensors", component="models", num_tensors=len(hf_tensors), path=str(output_path / "adapter_model.safetensors"))
+    log.debug("saved tensors", component="models", num_tensors=len(hf_tensors), path=str(output_path / "adapter_model.safetensors"))
 
     # Save PEFT config
     peft_config = peft.LoraConfig(
@@ -411,7 +411,7 @@ def convert_maxtext_lora_to_hf(
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     )
     peft_config.save_pretrained(output_path)
-    log.info("saved peft config", component="models", path=str(output_path))
+    log.debug("saved peft config", component="models", path=str(output_path))
 
 
 def round_up_seq_len(seq_len: int, min_seq_len: int = 32) -> int:
