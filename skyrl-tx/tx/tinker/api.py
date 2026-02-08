@@ -468,6 +468,7 @@ class SampleRequest(BaseModel):
     prompt_logprobs: bool | None = None
     topk_prompt_logprobs: int = 0
     type: Literal["sample"] = "sample"
+    session_id: str | None = None
 
     @model_validator(mode="after")
     def validate_model_source(self):
@@ -888,6 +889,7 @@ async def get_sampling_model(request: SampleRequest, session: AsyncSession) -> (
 @app.post("/api/v1/asample", response_model=FutureResponse)
 async def asample(request: SampleRequest, req: Request, session: AsyncSession = Depends(get_session)):
     """Generates samples from the model (async version)."""
+    request.session_id = req.headers.get("X-Tx-Param-Session-ID")
     base_model, model_path = await get_sampling_model(request, session)
 
     if base_model:

@@ -54,12 +54,16 @@ class ExternalInferenceClient:
     ):
         """Background task to call external engine and store result in database."""
         try:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "X-Job-ID": model_id,
+            }
+            if sample_req.session_id:
+                headers["X-Tx-Param-Session-ID"] = sample_req.session_id
+
             async with httpx.AsyncClient(
                 base_url=self.router_url,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "X-Job-ID": model_id,
-                },
+                headers=headers,
                 timeout=httpx.Timeout(300.0, connect=10.0),  # 5 minutes for inference, 10s for connect
             ) as http_client:
                 result = await self._forward_to_engine(sample_req, model_id, checkpoint_id, http_client)
