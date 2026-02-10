@@ -1,6 +1,7 @@
 """Background engine for processing training requests."""
 
 import argparse
+import json
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -12,7 +13,7 @@ from sqlmodel import create_engine, Session, select, update, func
 from flax import nnx
 from flax.training import checkpoints
 
-from tx.tinker.db_models import FutureDB, RequestStatus, CheckpointDB, CheckpointStatus
+from tx.tinker.db_models import FutureDB, ModelDB, RequestStatus, CheckpointDB, CheckpointStatus
 from tx.tinker import types
 from tx.tinker.config import EngineConfig, add_model
 from tx.tinker.backends import NativeBackend, MaxTextBackend, parse_maxtext_config
@@ -183,6 +184,10 @@ class TinkerEngine:
         # Allows restoring weights when same model_id is recreated
         self._model_cache: dict[str, dict] = {}
 
+        # Seed DB from GCS sidecar .json files before backend init (which is slow).
+        # Must happen before API clients call weights_info, which queries the DB.
+        self.reconcile_checkpoints_from_filesystem()
+
         # Initialize the backend (handles model state and computation)
         if config.maxtext_config_str:
             maxtext_config = parse_maxtext_config(config.maxtext_config_str)
@@ -248,11 +253,14 @@ class TinkerEngine:
             self.models[model_id].last_used = time.time()
 
     @contextmanager
-    def _checkpoint_status_context(self, model_id: str, checkpoint_id: str, checkpoint_type: types.CheckpointType):
+    def _checkpoint_status_context(
+        self, model_id: str, checkpoint_id: str, checkpoint_type: types.CheckpointType, output_path: Path
+    ):
         """Context manager to handle checkpoint DB status updates.
 
         Fetches the checkpoint entry, yields it, and updates its status to COMPLETED
         or FAILED based on whether an exception occurred.
+        On success, writes a sidecar JSON alongside the .tar.gz for DB-free reconstruction.
         """
         with Session(self.db_engine) as session:
             checkpoint_db = session.get(CheckpointDB, (model_id, checkpoint_id, checkpoint_type))
@@ -264,6 +272,7 @@ class TinkerEngine:
             try:
                 yield checkpoint_db
                 checkpoint_db.status = CheckpointStatus.COMPLETED
+                self._write_checkpoint_sidecar(model_id, checkpoint_id, checkpoint_type, output_path)
             except Exception as e:
                 log.exception("error saving checkpoint", component="tinker-engine", model_id=model_id, checkpoint_id=checkpoint_id, error=str(e))
                 checkpoint_db.status = CheckpointStatus.FAILED
@@ -273,6 +282,77 @@ class TinkerEngine:
                 checkpoint_db.completed_at = datetime.now(timezone.utc)
                 session.add(checkpoint_db)
                 session.commit()
+
+    def _write_checkpoint_sidecar(
+        self, model_id: str, checkpoint_id: str, checkpoint_type: types.CheckpointType, output_path: Path
+    ):
+        sidecar_path = output_path.with_name(output_path.name.replace(".tar.gz", ".json"))
+        lora_model = self.models[model_id]
+        sidecar = {
+            "model_id": model_id,
+            "base_model": self.config.base_model,
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_type": checkpoint_type.value,
+            "lora_config": lora_model.lora_config.model_dump(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        sidecar_path.write_text(json.dumps(sidecar))
+        log.info("wrote checkpoint sidecar", component="tinker-engine", path=str(sidecar_path))
+
+    def reconcile_checkpoints_from_filesystem(self):
+        """Scan checkpoints_base for sidecar .json files and insert missing DB records."""
+        tar_files = list(self.config.checkpoints_base.glob("**/*.tar.gz"))
+        log.info("reconciling checkpoints from filesystem", component="tinker-engine", tar_count=len(tar_files))
+
+        skipped = 0
+        models_added = 0
+        checkpoints_added = 0
+        with Session(self.db_engine) as session:
+            for tar_path in tar_files:
+                sidecar_path = tar_path.with_name(tar_path.name.replace(".tar.gz", ".json"))
+                if not sidecar_path.exists():
+                    log.warning("tar.gz without sidecar, skipping", component="tinker-engine", path=str(tar_path))
+                    skipped += 1
+                    continue
+                sidecar = json.loads(sidecar_path.read_text())
+                model_id = sidecar["model_id"]
+                checkpoint_id = sidecar["checkpoint_id"]
+                checkpoint_type = types.CheckpointType(sidecar["checkpoint_type"])
+
+                existing_model = session.get(ModelDB, model_id)
+                if existing_model is None:
+                    created_at = datetime.fromisoformat(sidecar["created_at"])
+                    session.add(ModelDB(
+                        model_id=model_id,
+                        base_model=sidecar["base_model"],
+                        lora_config=sidecar["lora_config"],
+                        status="reconciled",
+                        request_id=-1,
+                        created_at=created_at,
+                    ))
+                    models_added += 1
+
+                existing_ckpt = session.get(CheckpointDB, (model_id, checkpoint_id, checkpoint_type))
+                if existing_ckpt is None:
+                    created_at = datetime.fromisoformat(sidecar["created_at"])
+                    session.add(CheckpointDB(
+                        model_id=model_id,
+                        checkpoint_id=checkpoint_id,
+                        checkpoint_type=checkpoint_type,
+                        status=CheckpointStatus.COMPLETED,
+                        created_at=created_at,
+                        completed_at=created_at,
+                    ))
+                    checkpoints_added += 1
+
+            session.commit()
+        log.info(
+            "reconciliation complete",
+            component="tinker-engine",
+            models_added=models_added,
+            checkpoints_added=checkpoints_added,
+            skipped_no_sidecar=skipped,
+        )
 
     def find_batchable_model_passes(
         self, session: Session, request_type: types.RequestType
@@ -563,7 +643,7 @@ class TinkerEngine:
         checkpoint_id = request_data.path
         output_path = self.config.checkpoints_base / model_id / f"{checkpoint_id}.tar.gz"
 
-        with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
+        with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING, output_path):
             self.backend.save_checkpoint(output_path, model_id, self.models)
             log.info("saved training checkpoint", component="tinker-engine", model_id=model_id, output_path=str(output_path))
 
@@ -586,7 +666,7 @@ class TinkerEngine:
         checkpoint_id = Path(request_data.path).name
         output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
 
-        with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
+        with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER, output_path):
             self.backend.save_sampler_checkpoint(output_path, model_id, self.models)
 
             log.info(
