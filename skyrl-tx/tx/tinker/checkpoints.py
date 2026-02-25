@@ -10,11 +10,10 @@ from tx.tinker import types
 from tx.tinker.db_models import CheckpointDB, CheckpointStatus, ModelDB
 from observability import log
 
-# Maximum number of sampler checkpoints to keep per model (oldest are evicted)
-# TODO: make this configurable
-MAX_SAMPLER_CHECKPOINTS_PER_MODEL = 3
+# Default for max sampler checkpoints (actual value comes from EngineConfig)
+_DEFAULT_MAX_SAMPLER_CHECKPOINTS = 3
 LATEST_CHECKPOINT_PREFIX = "latest_"
-MAX_LATEST_TRAINING_CHECKPOINTS = 2
+MAX_LATEST_TRAINING_CHECKPOINTS = 1
 
 
 async def create_checkpoint(
@@ -77,7 +76,7 @@ async def evict_old_sampler_checkpoints(
     Called before creating a new sampler checkpoint to make room.
     Deletes the database entry, the checkpoint archive, and the extracted lora directory (if exists).
     """
-    max_count = MAX_SAMPLER_CHECKPOINTS_PER_MODEL
+    max_count = request.app.state.engine_config.max_sampler_checkpoints_per_model
     engine_config = request.app.state.engine_config
 
     # Get all sampler checkpoints for this model, ordered by creation time (oldest first)

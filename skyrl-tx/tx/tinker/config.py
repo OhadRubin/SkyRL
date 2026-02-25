@@ -67,6 +67,10 @@ class EngineConfig(BaseModel):
         description="MaxText config as space-separated key=value string. If set, uses MaxTextBackend instead of NativeBackend.",
         json_schema_extra={"argparse_type": str},
     )
+    max_sampler_checkpoints_per_model: int = Field(
+        default=3,
+        description="Maximum number of sampler checkpoints to keep per model (oldest are evicted)",
+    )
 
 
 def convert_env_var(env_name: str, env_value: str, expected_type: type):

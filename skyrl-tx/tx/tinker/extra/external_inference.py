@@ -16,8 +16,6 @@ from tx.tinker.db_models import FutureDB, RequestStatus
 from tx.utils.storage import download_and_unpack
 
 
-TIMEOUT_ERROR_PREFIX = "TINKER_TIMEOUT: "
-UNHEALTHY_DURATION_SECONDS = 120  # 2 minutes
 
 
 class AllServersFailed(Exception):
