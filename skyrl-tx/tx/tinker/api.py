@@ -29,11 +29,7 @@ from tx.tinker.db_models import (
     get_async_database_url,
 )
 from tx.tinker.extra import ExternalInferenceClient
-from tx.tinker.checkpoints import (
-    create_checkpoint,
-    evict_old_sampler_checkpoints,
-    evict_old_latest_training_checkpoints,
-)
+from tx.tinker.checkpoints import create_checkpoint
 from tx.utils.storage import download_file
 from observability import log, bootstrap, set_run_id, Events
 
@@ -247,7 +243,7 @@ class Datum(BaseModel):
 
 class ForwardBackwardInput(BaseModel):
     data: list[Datum]
-    loss_fn: Literal["cross_entropy", "importance_sampling", "ppo"]
+    loss_fn: str
     loss_fn_config: dict[str, float] | None = None
 
     def to_types(self) -> types.ForwardBackwardInput:
@@ -691,9 +687,6 @@ async def load_weights(request: LoadWeightsRequest, req: Request, session: Async
 @app.post("/api/v1/save_weights", response_model=FutureResponse)
 async def save_weights(request: SaveWeightsRequest, req: Request, session: AsyncSession = Depends(get_session)):
     """Saves weights and training state."""
-    # Evict old 'latest_*' training checkpoints to prevent unbounded growth
-    await evict_old_latest_training_checkpoints(req, session, request.model_id, request.path)
-
     # Create pending checkpoint entry (validates model exists)
     await create_checkpoint(
         session=session,
@@ -719,9 +712,6 @@ async def save_weights_for_sampler(
     request: SaveWeightsForSamplerRequest, req: Request, session: AsyncSession = Depends(get_session)
 ):
     """Saves weights in a format compatible with sampling/inference servers."""
-    # Evict old sampler checkpoints to keep only the last K
-    await evict_old_sampler_checkpoints(req, session, request.model_id)
-
     # Create pending checkpoint entry (validates model exists)
     await create_checkpoint(
         session=session,

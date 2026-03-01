@@ -14,6 +14,7 @@ from flax import nnx
 from flax.training import checkpoints
 
 from tx.tinker.db_models import FutureDB, ModelDB, RequestStatus, CheckpointDB, CheckpointStatus
+from tx.tinker.checkpoints import evict_old_sampler_checkpoints_sync, evict_old_latest_training_checkpoints_sync
 from tx.tinker import types
 from tx.tinker.config import EngineConfig, add_model
 from tx.tinker.backends import NativeBackend, MaxTextBackend, parse_maxtext_config
@@ -647,6 +648,10 @@ class TinkerEngine:
             self.backend.save_checkpoint(output_path, model_id, self.models)
             log.info("saved training checkpoint", component="tinker-engine", model_id=model_id, output_path=str(output_path))
 
+        # Evict old latest_* training checkpoints AFTER successful save
+        with Session(self.db_engine) as session:
+            evict_old_latest_training_checkpoints_sync(session, model_id, checkpoint_id, self.config)
+
         return types.SaveWeightsOutput(
             path=f"tinker://{model_id}/weights/{checkpoint_id}",
             type="save_weights",
@@ -676,6 +681,10 @@ class TinkerEngine:
                 adapter_index=lora_model.adapter_index,
                 output_path=str(output_path),
             )
+
+        # Evict old sampler checkpoints AFTER successful save
+        with Session(self.db_engine) as session:
+            evict_old_sampler_checkpoints_sync(session, model_id, self.config)
 
         return types.SaveWeightsForSamplerOutput(
             path=f"tinker://{model_id}/{checkpoint_id}" if request_data.return_path else None,
