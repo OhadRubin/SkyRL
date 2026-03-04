@@ -16,7 +16,7 @@ from tx.tinker import types
 from tx.tinker.config import EngineConfig
 from tx.tinker.backends.backend import AbstractBackend
 from tx.tinker.backends.utils import pad_batch
-from tx.tinker.loss_fns import LOSS_FUNCTIONS
+from tx.tinker.loss_fns import LOSS_FUNCTIONS, LOSS_TYPES
 from tx.utils.models import round_up_seq_len, convert_maxtext_lora_to_hf
 from tx.utils.storage import pack_and_upload
 from observability import log, bootstrap, set_run_id, Events
@@ -28,6 +28,112 @@ from MaxText import model_creation_utils as maxtext_model_creation
 from MaxText import sharding as maxtext_sharding
 from MaxText.integration.tunix.tunix_adapter import TunixMaxTextAdapter
 
+
+
+def compute_token_mis_metrics(
+    target_logprobs: jax.Array,
+    sampling_logprobs: jax.Array,
+    loss_mask: jax.Array,
+    advantages: jax.Array,
+    clip_low: jax.Array,
+    clip_high: jax.Array,
+) -> dict[str, float]:
+    """Compute token-level MIS diagnostic metrics.
+
+    Computes metrics about importance ratio distribution and mask activation patterns.
+    Only uses masked (valid) tokens for statistics.
+
+    Args:
+        target_logprobs: [batch, seq] log probs from learner policy
+        sampling_logprobs: [batch, seq] log probs from sampling policy
+        loss_mask: [batch, seq] mask for valid tokens
+        advantages: [batch, seq] per-token advantages
+        clip_low: [batch] lower clipping threshold per sequence
+        clip_high: [batch] upper clipping threshold per sequence
+
+    Returns:
+        Dict of metrics to log to wandb.
+    """
+    # Per-token log ratio and importance ratio
+    log_ratio = target_logprobs - sampling_logprobs
+    prob_ratio = jnp.exp(log_ratio)
+
+    # Flatten and select only valid tokens
+    flat_log_ratio = log_ratio.flatten()
+    flat_prob_ratio = prob_ratio.flatten()
+    flat_mask = loss_mask.flatten()
+    flat_advantages = advantages.flatten()
+
+    valid_mask = flat_mask > 0
+    valid_log_ratio = jnp.where(valid_mask, flat_log_ratio, jnp.nan)
+    valid_prob_ratio = jnp.where(valid_mask, flat_prob_ratio, jnp.nan)
+    valid_advantages = jnp.where(valid_mask, flat_advantages, jnp.nan)
+
+    n_valid = valid_mask.sum()
+
+    # Broadcast clip thresholds to token level: [batch, 1] -> [batch, seq]
+    clip_low_expanded = jnp.broadcast_to(clip_low[:, None], log_ratio.shape)
+    clip_high_expanded = jnp.broadcast_to(clip_high[:, None], log_ratio.shape)
+    flat_clip_low = clip_low_expanded.flatten()
+    flat_clip_high = clip_high_expanded.flatten()
+
+    # Token-level mask: which tokens would be zeroed by token_mis
+    in_bounds = (prob_ratio >= clip_low_expanded) & (prob_ratio <= clip_high_expanded)
+    flat_in_bounds = in_bounds.flatten()
+    token_mis_mask = jnp.where(valid_mask, flat_in_bounds.astype(jnp.float32), jnp.nan)
+
+    # Mask activation rates
+    masked_low = jnp.where(valid_mask, (flat_prob_ratio < flat_clip_low).astype(jnp.float32), 0.0)
+    masked_high = jnp.where(valid_mask, (flat_prob_ratio > flat_clip_high).astype(jnp.float32), 0.0)
+
+    mask_rate_total = 1.0 - jnp.nanmean(token_mis_mask)
+    mask_rate_low = masked_low.sum() / n_valid
+    mask_rate_high = masked_high.sum() / n_valid
+
+    # Mask rate by advantage sign
+    pos_adv_mask = valid_mask & (flat_advantages > 0)
+    neg_adv_mask = valid_mask & (flat_advantages < 0)
+    n_pos = pos_adv_mask.sum()
+    n_neg = neg_adv_mask.sum()
+
+    masked_given_pos_adv = jnp.where(pos_adv_mask, (~flat_in_bounds).astype(jnp.float32), 0.0).sum()
+    masked_given_neg_adv = jnp.where(neg_adv_mask, (~flat_in_bounds).astype(jnp.float32), 0.0).sum()
+    mask_rate_pos_adv = jnp.where(n_pos > 0, masked_given_pos_adv / n_pos, 0.0)
+    mask_rate_neg_adv = jnp.where(n_neg > 0, masked_given_neg_adv / n_neg, 0.0)
+
+    # Effective gradient mass: ratio of masked loss to total loss
+    unmasked_loss_mass = jnp.where(valid_mask & flat_in_bounds, flat_prob_ratio * jnp.abs(flat_advantages), 0.0).sum()
+    total_loss_mass = jnp.where(valid_mask, flat_prob_ratio * jnp.abs(flat_advantages), 0.0).sum()
+    effective_gradient_frac = jnp.where(total_loss_mass > 0, unmasked_loss_mass / total_loss_mass, 1.0)
+
+    # Percentiles via sorting (JAX doesn't have jnp.percentile, so we use sorted indexing)
+    # For efficiency, compute a few key percentiles
+    sorted_ratio = jnp.sort(jnp.where(valid_mask, flat_prob_ratio, jnp.inf))
+    n_valid_int = int(n_valid)
+
+    def safe_percentile(sorted_arr, p, n):
+        idx = jnp.clip(jnp.floor(p * n / 100).astype(jnp.int32), 0, n - 1)
+        return sorted_arr[idx]
+
+    # Metric names include reduction type suffix (required by tinker SDK's _metrics_reduction)
+    # :mean = weighted average by loss_fn_outputs count when combining chunked requests
+    # :sum = sum across chunks
+    return {
+        "mis/log_ratio_mean:mean": float(jnp.nanmean(valid_log_ratio)),
+        "mis/log_ratio_std:mean": float(jnp.nanstd(valid_log_ratio)),
+        "mis/prob_ratio_mean:mean": float(jnp.nanmean(valid_prob_ratio)),
+        "mis/prob_ratio_std:mean": float(jnp.nanstd(valid_prob_ratio)),
+        "mis/prob_ratio_p5:mean": float(safe_percentile(sorted_ratio, 5, n_valid)),
+        "mis/prob_ratio_p50:mean": float(safe_percentile(sorted_ratio, 50, n_valid)),
+        "mis/prob_ratio_p95:mean": float(safe_percentile(sorted_ratio, 95, n_valid)),
+        "mis/mask_rate_total:mean": float(mask_rate_total),
+        "mis/mask_rate_low:mean": float(mask_rate_low),
+        "mis/mask_rate_high:mean": float(mask_rate_high),
+        "mis/mask_rate_pos_adv:mean": float(mask_rate_pos_adv),
+        "mis/mask_rate_neg_adv:mean": float(mask_rate_neg_adv),
+        "mis/effective_gradient_frac:mean": float(effective_gradient_frac),
+        "mis/n_valid_tokens:sum": int(n_valid),
+    }
 
 
 def reset_adapter_weights(model):
@@ -355,12 +461,14 @@ class MaxTextBackend(AbstractBackend):
     def _process_forward_backward_batch(
         self,
         prepared_batch: types.PreparedModelPassBatch,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], dict[str, float]]:
         """Process forward_backward requests using MaxText model (single bucket).
 
         Returns:
-            List of per-sequence outputs, where each dict contains 'elementwise_loss' and 'logprobs'.
-            The list is indexed by position in the bucket (not by request_id).
+            Tuple of:
+            - List of per-sequence outputs, where each dict contains 'elementwise_loss' and 'logprobs'.
+              The list is indexed by position in the bucket (not by request_id).
+            - Dict of batch-level metrics (e.g., MIS diagnostics)
         """
         all_input_ids = prepared_batch.all_input_ids
         all_targets = prepared_batch.all_targets
@@ -372,7 +480,7 @@ class MaxTextBackend(AbstractBackend):
         all_clip_high = prepared_batch.all_clip_high  # TODO: must fix this slop - parallel arrays
 
         if not all_input_ids:
-            return []
+            return [], {}
 
         max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids), self.config.min_seq_len)
         input_ids = pad_batch(all_input_ids, max_len, np.int32)
@@ -472,6 +580,22 @@ class MaxTextBackend(AbstractBackend):
             if idx >= original_batch_size:
                 break
 
+        # Compute MIS metrics if using token_mis or seq_mis loss
+        # Metrics are computed on the full (pre-truncation) padded arrays for efficiency
+        batch_metrics = {}
+        mis_loss_types = {LOSS_TYPES.get("token_mis"), LOSS_TYPES.get("seq_mis")}
+        if any(lt in mis_loss_types for lt in all_loss_fn_types):
+            # Concatenate all micro-batch logprobs to compute metrics on full batch
+            all_target_logprobs = jnp.concatenate(logprobs_device, axis=0)[:original_batch_size]
+            batch_metrics = compute_token_mis_metrics(
+                target_logprobs=all_target_logprobs,
+                sampling_logprobs=jnp.array(sampling_logprobs[:original_batch_size]),
+                loss_mask=jnp.array(loss_mask[:original_batch_size]),
+                advantages=jnp.array(advantages[:original_batch_size]),
+                clip_low=clip_low[:original_batch_size],
+                clip_high=clip_high[:original_batch_size],
+            )
+
         # Return per-sequence outputs (indexed by bucket position)
         per_seq_outputs = []
         for i in range(len(token_losses_out)):
@@ -490,7 +614,7 @@ class MaxTextBackend(AbstractBackend):
                 },
             })
 
-        return per_seq_outputs
+        return per_seq_outputs, batch_metrics
 
     def split_batch_by_bucket(
         self,
@@ -580,14 +704,20 @@ class MaxTextBackend(AbstractBackend):
 
         # Collect per-sequence outputs indexed by original sequence index
         per_seq_outputs: dict[int, dict] = {}
+        # Aggregate metrics across all buckets (use last bucket's metrics as they're batch-level)
+        aggregated_metrics: dict[str, float] = {}
 
         for bucket_seq_len, (bucket_batch, seq_idx_map) in sorted(buckets.items()):
-            bucket_outputs = self._process_forward_backward_batch(bucket_batch)
+            bucket_outputs, bucket_metrics = self._process_forward_backward_batch(bucket_batch)
 
             # Map bucket outputs back to original sequence indices
             for bucket_idx, output in enumerate(bucket_outputs):
                 orig_idx = seq_idx_map[bucket_idx]
                 per_seq_outputs[orig_idx] = output
+
+            # Merge bucket metrics (later buckets overwrite - for single bucket case this is fine,
+            # for multi-bucket we'd want weighted averaging but that's a future enhancement)
+            aggregated_metrics.update(bucket_metrics)
 
         # Aggregate per-sequence outputs back into per-request results
         all_results: dict[str, types.ForwardBackwardOutput | types.ErrorResponse] = {}
@@ -606,7 +736,7 @@ class MaxTextBackend(AbstractBackend):
             all_results[request_id] = types.ForwardBackwardOutput(
                 loss_fn_output_type="scalar",
                 loss_fn_outputs=loss_fn_outputs,
-                metrics={},
+                metrics=aggregated_metrics,
             )
 
         return all_results

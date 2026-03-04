@@ -38,6 +38,7 @@ ID_PATTERN = r"^[a-zA-Z0-9_-]+$"
 ID_MAX_LENGTH = 255
 
 FULFILLED_CLEANUP_INTERVAL_SECONDS = 600
+FULFILLED_GRACE_PERIOD_SECONDS = 600  # 10 minutes grace before cleanup
 
 
 async def _cleanup_fulfilled_futures(app: FastAPI):
@@ -46,7 +47,8 @@ async def _cleanup_fulfilled_futures(app: FastAPI):
         await asyncio.sleep(FULFILLED_CLEANUP_INTERVAL_SECONDS)
         try:
             async with AsyncSession(app.state.db_engine) as session:
-                stmt = sa_delete(FutureDB).where(FutureDB.fulfilled == True)
+                cutoff = datetime.now(timezone.utc) - timedelta(seconds=FULFILLED_GRACE_PERIOD_SECONDS)
+                stmt = sa_delete(FutureDB).where(FutureDB.fulfilled == True, FutureDB.completed_at < cutoff)
                 result = await session.exec(stmt)
                 await session.commit()
                 if result.rowcount > 0:
