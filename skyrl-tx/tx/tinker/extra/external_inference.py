@@ -3,9 +3,10 @@ import shutil
 import sys
 
 import httpx
-from tenacity import retry, stop_after_attempt, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, retry_if_exception_type, wait_exponential
 from datetime import datetime, timezone
 from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.exc import OperationalError
 
 
 from observability import log, bootstrap, set_run_id, Events
@@ -31,6 +32,8 @@ class ExternalInferenceClient:
 
     MAX_PREFIX_LEVELS = 4  # Try up to 4 prefix granularities for hierarchical matching
     MIN_PREFIX_CHUNKS = 3  # Skip prefixes shorter than this (avoids matching on just system prompt)
+    MAX_CONCURRENT_REQUESTS = 1000  # Limit concurrent background tasks to prevent pool exhaustion
+    MAX_PENDING_TASKS = 2000  # Maximum queued tasks before rejecting new requests
 
     def __init__(self, engine_config: EngineConfig, db_engine):
         self.router_url = engine_config.external_inference_urls[0]
@@ -38,10 +41,18 @@ class ExternalInferenceClient:
         self.checkpoints_base = engine_config.checkpoints_base
         self.lora_base_dir = engine_config.external_inference_lora_base
         self.db_engine = db_engine
+        self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_REQUESTS)
+        self._pending_count = 0
+        self._pending_lock = asyncio.Lock()
 
     @property
     def cache_stats(self) -> str:
         return "handled by router"
+
+    async def check_capacity(self) -> bool:
+        """Check if we can accept more requests. Returns True if under capacity."""
+        async with self._pending_lock:
+            return self._pending_count < self.MAX_PENDING_TASKS
 
     async def call_and_store_result(
         self,
@@ -51,27 +62,45 @@ class ExternalInferenceClient:
         checkpoint_id: str,
     ):
         """Background task to call external engine and store result in database."""
+        async with self._pending_lock:
+            self._pending_count += 1
+
         try:
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "X-Job-ID": model_id,
-            }
-            if sample_req.session_id:
-                headers["X-Tx-Param-Session-ID"] = sample_req.session_id
+            async with self._semaphore:
+                try:
+                    headers = {
+                        "Authorization": f"Bearer {self.api_key}",
+                        "X-Job-ID": model_id,
+                    }
+                    if sample_req.session_id:
+                        headers["X-Tx-Param-Session-ID"] = sample_req.session_id
 
-            async with httpx.AsyncClient(
-                base_url=self.router_url,
-                headers=headers,
-                timeout=httpx.Timeout(300.0, connect=10.0),  # 5 minutes for inference, 10s for connect
-            ) as http_client:
-                result = await self._forward_to_engine(sample_req, model_id, checkpoint_id, http_client)
-            result_data = result.model_dump()
-            status = RequestStatus.COMPLETED
-        except Exception as e:
-            log.error("unexpected error in external inference", component="external_inference", error=str(e))
-            result_data = {"error": str(e), "status": "failed"}
-            status = RequestStatus.FAILED
+                    async with httpx.AsyncClient(
+                        base_url=self.router_url,
+                        headers=headers,
+                        timeout=httpx.Timeout(300.0, connect=10.0),  # 5 minutes for inference, 10s for connect
+                    ) as http_client:
+                        result = await self._forward_to_engine(sample_req, model_id, checkpoint_id, http_client)
+                    result_data = result.model_dump()
+                    status = RequestStatus.COMPLETED
+                except Exception as e:
+                    log.error("unexpected error in external inference", component="external_inference", error=str(e))
+                    result_data = {"error": str(e), "status": "failed"}
+                    status = RequestStatus.FAILED
 
+                await self._store_result_with_retry(request_id, result_data, status)
+        finally:
+            async with self._pending_lock:
+                self._pending_count -= 1
+
+    @retry(
+        stop=stop_after_attempt(10),
+        wait=wait_exponential(multiplier=0.1, min=0.1, max=5),
+        retry=retry_if_exception_type(OperationalError),
+        reraise=True,
+    )
+    async def _store_result_with_retry(self, request_id: int, result_data: dict, status: RequestStatus):
+        """Store result in DB with retry for SQLite lock contention."""
         async with AsyncSession(self.db_engine) as session:
             future = await session.get(FutureDB, request_id)
             future.result_data = result_data

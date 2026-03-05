@@ -80,5 +80,12 @@ include-package-data = true
 [tool.setuptools.dynamic]
 version = {attr = "tx.__version__"}
 
+[dependency-groups]
+dev = [
+    "pydantic>=2.12.5",
+    "pytest>=8.4.2",
+    "structlog>=25.5.0",
+]
+
 [project.scripts]
 tx = "tx.run.main:app"

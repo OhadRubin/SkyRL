@@ -9,6 +9,8 @@ from pathlib import Path
 
 from pydantic import BaseModel
 from sqlmodel import create_engine, Session, select, update, func
+from sqlalchemy.exc import OperationalError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from flax import nnx
 from flax.training import checkpoints
@@ -177,7 +179,14 @@ class TinkerEngine:
     ):
         """Initialize the engine with a database connection and base model."""
         self.config = config
-        self.db_engine = create_engine(config.database_url, echo=False, connect_args={"timeout": 60})
+        self.db_engine = create_engine(
+            config.database_url,
+            echo=False,
+            pool_size=20,
+            max_overflow=50,
+            pool_timeout=120,
+            connect_args={"timeout": 120},
+        )
 
         # Store LoRA model metadata (model_id -> metadata)
         self.models: dict[str, types.ModelMetadata] = {}
@@ -738,6 +747,12 @@ class TinkerEngine:
 
         return adapter_indices
 
+    @retry(
+        stop=stop_after_attempt(10),
+        wait=wait_exponential(multiplier=0.1, min=0.1, max=5),
+        retry=retry_if_exception_type(OperationalError),
+        reraise=True,
+    )
     def _complete_futures(self, results: dict[str, BaseModel]):
         """Helper method to complete multiple futures in the database.
 

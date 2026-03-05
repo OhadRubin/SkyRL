@@ -136,6 +136,119 @@ def compute_token_mis_metrics(
     }
 
 
+def compute_adam_tuning_metrics(
+    mean_grads: nnx.State,
+    lora_params: nnx.State,
+    optimizer: nnx.Optimizer,
+    learning_rate: float,
+    eps: float,
+) -> dict[str, float]:
+    """Compute metrics for tuning Adam optimizer hyperparameters.
+
+    These metrics help diagnose whether beta1, beta2, and eps need adjustment:
+    - Gradient stats: variance helps tune beta1 (momentum)
+    - Optimizer state (m, v): magnitudes affected by beta1/beta2
+    - Effective LR: lr / sqrt(v + eps) shows if eps matters
+    - Update stats: actual parameter changes
+
+    Args:
+        mean_grads: Mean gradients (nnx.State pytree)
+        lora_params: Current LoRA parameters (nnx.State pytree)
+        optimizer: The nnx.Optimizer containing Adam state
+        learning_rate: Current learning rate
+        eps: Adam epsilon parameter
+
+    Returns:
+        Dict of metrics to log to wandb.
+    """
+    # Flatten gradients to compute global stats
+    grad_leaves = jax.tree.leaves(mean_grads)
+    grad_flat = jnp.concatenate([g.flatten() for g in grad_leaves])
+
+    # Gradient statistics
+    grad_norm = jnp.sqrt(jnp.sum(grad_flat ** 2))
+    grad_mean = jnp.mean(grad_flat)
+    grad_std = jnp.std(grad_flat)
+    grad_abs_mean = jnp.mean(jnp.abs(grad_flat))
+
+    # Per-layer gradient norms (for detecting layer-specific instabilities)
+    layer_norms = [jnp.sqrt(jnp.sum(g ** 2)) for g in grad_leaves]
+    grad_norm_max_layer = jnp.max(jnp.array(layer_norms))
+    grad_norm_min_layer = jnp.min(jnp.array(layer_norms))
+
+    # Extract Adam state (mu = first moment, nu = second moment)
+    # optax.adamw with inject_hyperparams wraps state in ScaleByAdamState
+    opt_state = optimizer.opt_state
+    # Navigate through InjectHyperparamsState -> inner[0] (ScaleByAdamState)
+    inner_states = opt_state.inner_state
+    adam_state = inner_states[0]  # ScaleByAdamState(count, mu, nu)
+
+    # First moment (momentum) statistics
+    mu_leaves = jax.tree.leaves(adam_state.mu)
+    mu_flat = jnp.concatenate([m.flatten() for m in mu_leaves])
+    m_norm = jnp.sqrt(jnp.sum(mu_flat ** 2))
+    m_abs_mean = jnp.mean(jnp.abs(mu_flat))
+
+    # Second moment (adaptive LR denominator) statistics
+    nu_leaves = jax.tree.leaves(adam_state.nu)
+    nu_flat = jnp.concatenate([v.flatten() for v in nu_leaves])
+    v_norm = jnp.sqrt(jnp.sum(nu_flat ** 2))
+    v_mean = jnp.mean(nu_flat)
+    v_max = jnp.max(nu_flat)
+
+    # Effective learning rate: lr / sqrt(v + eps)
+    # This shows the actual step size per parameter
+    effective_lr = learning_rate / (jnp.sqrt(nu_flat) + eps)
+    effective_lr_mean = jnp.mean(effective_lr)
+    effective_lr_std = jnp.std(effective_lr)
+    effective_lr_min = jnp.min(effective_lr)
+    effective_lr_max = jnp.max(effective_lr)
+
+    # Parameter statistics (for update-to-param ratio)
+    param_leaves = jax.tree.leaves(lora_params)
+    param_flat = jnp.concatenate([p.flatten() for p in param_leaves])
+    param_norm = jnp.sqrt(jnp.sum(param_flat ** 2))
+
+    # Compute approximate update norm: lr * m / (sqrt(v) + eps)
+    # This is what Adam actually applies (simplified, ignoring bias correction)
+    update_flat = learning_rate * mu_flat / (jnp.sqrt(nu_flat) + eps)
+    update_norm = jnp.sqrt(jnp.sum(update_flat ** 2))
+
+    # Update-to-param ratio (health metric)
+    update_to_param_ratio = update_norm / (param_norm + 1e-12)
+
+    # m/v ratio (balance between momentum and adaptive scaling)
+    m_to_v_ratio = m_norm / (v_norm + 1e-12)
+
+    return {
+        # Gradient statistics (help tune beta1)
+        "adam/grad_norm:mean": float(grad_norm),
+        "adam/grad_mean:mean": float(grad_mean),
+        "adam/grad_std:mean": float(grad_std),
+        "adam/grad_abs_mean:mean": float(grad_abs_mean),
+        "adam/grad_norm_max_layer:mean": float(grad_norm_max_layer),
+        "adam/grad_norm_min_layer:mean": float(grad_norm_min_layer),
+        # First moment (momentum) statistics
+        "adam/m_norm:mean": float(m_norm),
+        "adam/m_abs_mean:mean": float(m_abs_mean),
+        # Second moment statistics (help tune beta2)
+        "adam/v_norm:mean": float(v_norm),
+        "adam/v_mean:mean": float(v_mean),
+        "adam/v_max:mean": float(v_max),
+        # Effective learning rate (help tune eps)
+        "adam/effective_lr_mean:mean": float(effective_lr_mean),
+        "adam/effective_lr_std:mean": float(effective_lr_std),
+        "adam/effective_lr_min:mean": float(effective_lr_min),
+        "adam/effective_lr_max:mean": float(effective_lr_max),
+        # Update statistics
+        "adam/update_norm:mean": float(update_norm),
+        "adam/update_to_param_ratio:mean": float(update_to_param_ratio),
+        "adam/param_norm:mean": float(param_norm),
+        # Balance metric
+        "adam/m_to_v_ratio:mean": float(m_to_v_ratio),
+    }
+
+
 def reset_adapter_weights(model):
 
     state = nnx.state(model)
@@ -750,7 +863,7 @@ class MaxTextBackend(AbstractBackend):
         """Process an optim_step request."""
         if self.accumulated_grads.count[0] == 0:
             log.warning("no accumulated gradients, skipping optimizer step", component="maxtext", model_id=model_id)
-            return types.OptimStepOutput()
+            return types.OptimStepOutput(metrics={})
 
         optimizer = self.optimizers[model_id]
         hp = optimizer.opt_state.hyperparams
@@ -761,13 +874,23 @@ class MaxTextBackend(AbstractBackend):
 
         mean_grads = self.accumulated_grads.get_mean()
 
+        # Compute Adam tuning metrics BEFORE the optimizer step
+        # (captures gradient stats and pre-step optimizer state)
+        adam_metrics = compute_adam_tuning_metrics(
+            mean_grads=mean_grads,
+            lora_params=self.lora_params,
+            optimizer=optimizer,
+            learning_rate=request_data.adam_params.learning_rate,
+            eps=request_data.adam_params.eps,
+        )
+
         with jax.set_mesh(self.mesh), nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
             self._optim_step(self.model, optimizer, mean_grads)
 
         self.accumulated_grads = self.accumulated_grads.reset()
         log.info("applied optimizer step", component="maxtext", model_id=model_id)
 
-        return types.OptimStepOutput()
+        return types.OptimStepOutput(metrics=adam_metrics)
 
     def process_forward_batch(
         self,

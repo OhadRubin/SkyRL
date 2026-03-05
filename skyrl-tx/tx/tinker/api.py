@@ -65,10 +65,11 @@ async def lifespan(app: FastAPI):
     app.state.db_engine = create_async_engine(
         db_url,
         echo=False,
-        pool_size=20,
-        max_overflow=40,
-        pool_timeout=60,
-        connect_args={"timeout": 60},
+        pool_size=200,
+        max_overflow=1000,
+        pool_timeout=300,
+        pool_recycle=600,
+        connect_args={"timeout": 300},
     )
 
     async with app.state.db_engine.begin() as conn:
@@ -482,6 +483,23 @@ async def healthz():
     return HealthResponse(status="ok")
 
 
+@app.get("/api/v1/stats")
+async def stats(req: Request):
+    """Returns server statistics including queue depth."""
+    result = {"status": "ok"}
+    if req.app.state.external_inference_client:
+        client = req.app.state.external_inference_client
+        async with client._pending_lock:
+            pending = client._pending_count
+        result["external_inference"] = {
+            "pending_tasks": pending,
+            "max_pending": client.MAX_PENDING_TASKS,
+            "max_concurrent": client.MAX_CONCURRENT_REQUESTS,
+            "utilization_pct": round(pending / client.MAX_PENDING_TASKS * 100, 1),
+        }
+    return result
+
+
 @app.post("/api/v1/create_session", response_model=CreateSessionResponse)
 async def create_session(request: CreateSessionRequest, session: AsyncSession = Depends(get_session)):
     """Create a new session + persist in DB"""
@@ -771,6 +789,11 @@ async def get_sampling_model(request: SampleRequest, session: AsyncSession) -> (
 @app.post("/api/v1/asample", response_model=FutureResponse)
 async def asample(request: SampleRequest, req: Request, session: AsyncSession = Depends(get_session)):
     """Generates samples from the model (async version)."""
+    # Check capacity BEFORE creating DB entry to avoid orphan PENDING entries
+    if req.app.state.external_inference_client:
+        if not await req.app.state.external_inference_client.check_capacity():
+            raise HTTPException(status_code=503, detail="Server overloaded, too many pending requests")
+
     request.session_id = req.headers.get("X-Tx-Param-Session-ID")
     base_model, model_path = await get_sampling_model(request, session)
 
@@ -839,15 +862,17 @@ async def retrieve_future(request: RetrieveFutureRequest, req: Request):
     timeout = 300  # 5 minutes
     deadline = time.perf_counter() + timeout
 
-    # Start with 100ms, grow to 1s
-    poll = 0.1
-    max_poll = 1.0
+    # Start with 200ms, grow to 2s (reduced polling frequency for scale)
+    poll = 0.2
+    max_poll = 2.0
+    request_id = int(request.request_id)
 
     while time.perf_counter() < deadline:
-        try:
-            async with AsyncSession(req.app.state.db_engine) as session:
+        # Reuse a single session for the entire polling loop
+        async with AsyncSession(req.app.state.db_engine) as session:
+            try:
                 # First, only query the status to avoid deserializing JSON data
-                statement = select(FutureDB.status).where(FutureDB.request_id == int(request.request_id))
+                statement = select(FutureDB.status).where(FutureDB.request_id == request_id)
                 result = await session.exec(statement)
                 status = result.first()
 
@@ -856,7 +881,7 @@ async def retrieve_future(request: RetrieveFutureRequest, req: Request):
 
                 # Only fetch full record if status is terminal (completed or failed)
                 if status in (RequestStatus.COMPLETED, RequestStatus.FAILED):
-                    statement = select(FutureDB).where(FutureDB.request_id == int(request.request_id))
+                    statement = select(FutureDB).where(FutureDB.request_id == request_id)
                     result = await session.exec(statement)
                     future = result.first()
 
@@ -878,12 +903,11 @@ async def retrieve_future(request: RetrieveFutureRequest, req: Request):
                     if status == RequestStatus.FAILED:
                         if result_data and "error" in result_data:
                             raise HTTPException(status_code=400, detail=result_data["error"])
-                        else:
-                            raise HTTPException(status_code=500, detail="Unknown error")
-        except SATimeoutError:
-            pass
+                        raise HTTPException(status_code=500, detail="Unknown error")
+            except SATimeoutError:
+                pass
 
-        # Exponential backoff
+        # Exponential backoff (session released during sleep)
         await asyncio.sleep(poll)
         poll = min(poll * 1.5, max_poll)
 

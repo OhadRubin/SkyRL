@@ -125,7 +125,7 @@ class OptimStepInput(BaseModel):
 
 
 class OptimStepOutput(BaseModel):
-    pass
+    metrics: dict[str, float] = {}
 
 
 class SaveWeightsForSamplerInput(BaseModel):
