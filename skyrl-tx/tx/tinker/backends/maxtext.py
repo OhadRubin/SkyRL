@@ -462,15 +462,29 @@ class MaxTextBackend(AbstractBackend):
             )
             return loss, target_logprobs, per_token_losses, grads
 
+        def forward_only_maxtext(
+            model, input_ids, positions, target_ids, loss_mask, loss_fn_types, sampling_logprobs, advantages, clip_low, clip_high,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            """Forward-only for MaxText model (no gradients)."""
+            loss, (target_logprobs, per_token_losses) = loss_for_maxtext_model(
+                model, input_ids, positions, target_ids, loss_mask, loss_fn_types, sampling_logprobs, advantages, clip_low, clip_high,
+            )
+            return loss, target_logprobs, per_token_losses
+
         data_sharding = maxtext_sharding.get_input_data_sharding(self.maxtext_config, self.mesh)
 
         if self.config.enforce_eager:
             self._forward_backward = forward_backward_maxtext
+            self._forward = forward_only_maxtext
         else:
             with jax.set_mesh(self.mesh), nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
                 self._forward_backward = jax.jit(
                     forward_backward_maxtext,
                     # model, input_ids, positions, target_ids, loss_mask, loss_fn_types (1D), sampling_logprobs, advantages, clip_low (1D), clip_high (1D)
+                    in_shardings=(None, data_sharding, data_sharding, data_sharding, data_sharding, None, data_sharding, data_sharding, None, None),
+                )
+                self._forward = jax.jit(
+                    forward_only_maxtext,
                     in_shardings=(None, data_sharding, data_sharding, data_sharding, data_sharding, None, data_sharding, data_sharding, None, None),
                 )
 
@@ -729,6 +743,145 @@ class MaxTextBackend(AbstractBackend):
 
         return per_seq_outputs, batch_metrics
 
+    def _process_forward_batch(
+        self,
+        prepared_batch: types.PreparedModelPassBatch,
+    ) -> tuple[list[dict], dict[str, float]]:
+        """Process forward-only requests using MaxText model (single bucket, no gradients).
+
+        Returns:
+            Tuple of:
+            - List of per-sequence outputs, where each dict contains 'elementwise_loss' and 'logprobs'.
+              The list is indexed by position in the bucket (not by request_id).
+            - Dict of batch-level metrics (empty for forward-only)
+        """
+        all_input_ids = prepared_batch.all_input_ids
+        all_targets = prepared_batch.all_targets
+        all_token_weights = prepared_batch.all_token_weights
+        all_sampling_logprobs = prepared_batch.all_sampling_logprobs
+        all_advantages = prepared_batch.all_advantages
+        all_loss_fn_types = prepared_batch.all_loss_fn_types
+        all_clip_low = prepared_batch.all_clip_low
+        all_clip_high = prepared_batch.all_clip_high
+
+        if not all_input_ids:
+            return [], {}
+
+        max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids), self.config.min_seq_len)
+        input_ids = pad_batch(all_input_ids, max_len, np.int32)
+        target_ids = pad_batch(all_targets, max_len, np.int32)
+        loss_mask = pad_batch(all_token_weights, max_len, np.float32)
+        sampling_logprobs = pad_batch(all_sampling_logprobs, max_len, np.float32)
+        advantages = pad_batch(all_advantages, max_len, np.float32)
+        loss_fn_types = jnp.array(all_loss_fn_types, dtype=jnp.int32)
+        clip_low = jnp.array(all_clip_low, dtype=jnp.float32)
+        clip_high = jnp.array(all_clip_high, dtype=jnp.float32)
+
+        batch_size = input_ids.shape[0]
+        seq_len = input_ids.shape[1]
+
+        # Pad batch to be divisible by FSDP size for sharding compatibility
+        fsdp_size = self.mesh.shape['fsdp']
+        original_batch_size = batch_size
+        if batch_size % fsdp_size != 0:
+            padded_batch_size = ((batch_size + fsdp_size - 1) // fsdp_size) * fsdp_size
+            pad_size = padded_batch_size - batch_size
+            input_ids = np.pad(input_ids, ((0, pad_size), (0, 0)), mode='constant', constant_values=0)
+            target_ids = np.pad(target_ids, ((0, pad_size), (0, 0)), mode='constant', constant_values=0)
+            loss_mask = np.pad(loss_mask, ((0, pad_size), (0, 0)), mode='constant', constant_values=0)
+            sampling_logprobs = np.pad(sampling_logprobs, ((0, pad_size), (0, 0)), mode='constant', constant_values=0)
+            advantages = np.pad(advantages, ((0, pad_size), (0, 0)), mode='constant', constant_values=0)
+            loss_fn_types = jnp.pad(loss_fn_types, (0, pad_size), mode='constant', constant_values=0)
+            clip_low = jnp.pad(clip_low, (0, pad_size), mode='constant', constant_values=0.8)
+            clip_high = jnp.pad(clip_high, (0, pad_size), mode='constant', constant_values=1.2)
+            batch_size = padded_batch_size
+            log.info("padded batch for fsdp sharding", component="maxtext", original_batch_size=original_batch_size, padded_batch_size=padded_batch_size)
+
+        positions = jnp.broadcast_to(jnp.arange(seq_len), (batch_size, seq_len))
+        seq_lens = [len(seq) for seq in all_input_ids]
+
+        data_sharding = maxtext_sharding.get_input_data_sharding(self.maxtext_config, self.mesh)
+
+        token_losses_device = []
+        logprobs_device = []
+        total_bs = batch_size
+        micro_bs = self._micro_batch_size(total_bs)
+
+        with jax.set_mesh(self.mesh), nn_partitioning.axis_rules(self.maxtext_config.logical_axis_rules):
+            with self._jit_timing_context(seq_len, mode="train"):
+                for mb_start in range(0, total_bs, micro_bs):
+                    mb_end = min(mb_start + micro_bs, total_bs)
+                    log.info("forward batch", component="maxtext", mb_start=mb_start, mb_end=mb_end, seq_len=seq_len)
+                    tic = time.time()
+
+                    mb_input_ids = jax.device_put(input_ids[mb_start:mb_end], data_sharding)
+                    mb_positions = jax.device_put(positions[mb_start:mb_end], data_sharding)
+                    mb_target_ids = jax.device_put(target_ids[mb_start:mb_end], data_sharding)
+                    mb_loss_mask = jax.device_put(loss_mask[mb_start:mb_end], data_sharding)
+                    mb_loss_fn_types = loss_fn_types[mb_start:mb_end]
+                    mb_sampling_logprobs = jax.device_put(sampling_logprobs[mb_start:mb_end], data_sharding)
+                    mb_advantages = jax.device_put(advantages[mb_start:mb_end], data_sharding)
+                    mb_clip_low = clip_low[mb_start:mb_end]
+                    mb_clip_high = clip_high[mb_start:mb_end]
+
+                    _, target_logprobs, per_token_losses = self._forward(
+                        self.model,
+                        mb_input_ids,
+                        mb_positions,
+                        mb_target_ids,
+                        mb_loss_mask,
+                        mb_loss_fn_types,
+                        mb_sampling_logprobs,
+                        mb_advantages,
+                        mb_clip_low,
+                        mb_clip_high,
+                    )
+
+                    _ = jax.device_get(target_logprobs)
+
+                    took = time.time() - tic
+                    tokens_processed = (mb_end - mb_start) * seq_len
+                    tokens_per_sec = tokens_processed / took if took > 0 else float('nan')
+                    log.info("forward complete", component="maxtext", mb_start=mb_start, mb_end=mb_end, elapsed_s=round(took, 3), tokens_per_sec=round(tokens_per_sec, 1))
+
+                    token_losses_device.append(per_token_losses)
+                    logprobs_device.append(target_logprobs)
+
+        token_losses_host, logprobs_host = jax.device_get((token_losses_device, logprobs_device))
+
+        token_losses_out = []
+        logprobs_out = []
+        idx = 0
+        for mb_losses, mb_logprobs in zip(token_losses_host, logprobs_host):
+            for i in range(mb_losses.shape[0]):
+                if idx >= original_batch_size:
+                    break
+                token_losses_out.append(mb_losses[i, :seq_lens[idx]].astype(jnp.float32))
+                logprobs_out.append(mb_logprobs[i, :seq_lens[idx]].astype(jnp.float32))
+                idx += 1
+            if idx >= original_batch_size:
+                break
+
+        # Return per-sequence outputs (indexed by bucket position)
+        per_seq_outputs = []
+        for i in range(len(token_losses_out)):
+            token_losses = token_losses_out[i]
+            token_logprobs = logprobs_out[i]
+            per_seq_outputs.append({
+                "elementwise_loss": {
+                    "data": token_losses.tolist(),
+                    "dtype": "float32",
+                    "shape": [token_losses.shape[0]],
+                },
+                "logprobs": {
+                    "data": token_logprobs.tolist(),
+                    "dtype": "float32",
+                    "shape": [token_logprobs.shape[0]],
+                },
+            })
+
+        return per_seq_outputs, {}
+
     def split_batch_by_bucket(
         self,
         prepared_batch: types.PreparedModelPassBatch,
@@ -896,8 +1049,51 @@ class MaxTextBackend(AbstractBackend):
         self,
         prepared_batch: types.PreparedModelPassBatch,
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
-        """Process forward-only requests - not implemented for MaxText."""
-        raise NotImplementedError("Forward-only pass not yet implemented for MaxText backend")
+        """Process forward-only requests, bucketing by sequence length to minimize padding.
+
+        Same as process_forward_backward_batch but without gradient computation.
+        """
+        if not prepared_batch.all_input_ids:
+            return {}
+
+        buckets = self.split_batch_by_bucket(prepared_batch)
+
+        if len(buckets) > 1:
+            bucket_sizes = {k: len(v[0].all_input_ids) for k, v in buckets.items()}
+            log.info("split batch into buckets (forward)", component="maxtext", num_buckets=len(buckets), bucket_sizes=bucket_sizes)
+
+        per_seq_outputs: dict[int, dict] = {}
+        aggregated_metrics: dict[str, float] = {}
+
+        for bucket_seq_len, (bucket_batch, seq_idx_map) in sorted(buckets.items()):
+            bucket_outputs, bucket_metrics = self._process_forward_batch(bucket_batch)
+
+            for bucket_idx, output in enumerate(bucket_outputs):
+                orig_idx = seq_idx_map[bucket_idx]
+                per_seq_outputs[orig_idx] = output
+
+            aggregated_metrics.update(bucket_metrics)
+
+        all_results: dict[str, types.ForwardBackwardOutput | types.ErrorResponse] = {}
+
+        for request_id, _, start_idx, end_idx in prepared_batch.request_batch_slices:
+            loss_fn_outputs = []
+
+            for orig_idx in range(start_idx, end_idx):
+                if orig_idx not in per_seq_outputs:
+                    raise RuntimeError(
+                        f"Missing output for sequence {orig_idx} in request {request_id}. "
+                        f"This indicates a bug in bucket splitting/merging."
+                    )
+                loss_fn_outputs.append(per_seq_outputs[orig_idx])
+
+            all_results[request_id] = types.ForwardBackwardOutput(
+                loss_fn_output_type="scalar",
+                loss_fn_outputs=loss_fn_outputs,
+                metrics=aggregated_metrics,
+            )
+
+        return all_results
 
     def process_sample_batch(
         self,

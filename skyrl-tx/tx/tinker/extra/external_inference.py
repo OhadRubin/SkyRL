@@ -142,11 +142,17 @@ class ExternalInferenceClient:
             "return_token_ids": True,
         }
 
+        # Request prompt logprobs if needed (vLLM extra parameter)
+        if request.prompt_logprobs:
+            payload["prompt_logprobs"] = 1  # Get top-1 logprob per prompt token
+
         response = await http_client.post("/completions", json=payload)
         response.raise_for_status()
         result = response.json()
 
         sequences = []
+        prompt_logprobs_out: list[float | None] = []
+
         for choice in result["choices"]:
             lp = choice["logprobs"]
             sequences.append(
@@ -157,4 +163,26 @@ class ExternalInferenceClient:
                 )
             )
 
-        return types.SampleOutput(sequences=sequences, prompt_logprobs=[])
+            # Extract prompt logprobs if present (vLLM returns these at choice level, not inside logprobs)
+            if request.prompt_logprobs and "prompt_logprobs" in choice and choice["prompt_logprobs"]:
+                # vLLM returns list of dicts with token -> logprob mappings
+                # Extract the logprob for each actual prompt token
+                for i, token_probs in enumerate(choice["prompt_logprobs"]):
+                    if token_probs is None:
+                        prompt_logprobs_out.append(None)
+                    elif isinstance(token_probs, dict):
+                        # Get the logprob for the actual token at this position
+                        prompt_token = prompt_tokens[i] if i < len(prompt_tokens) else None
+                        if prompt_token is not None and str(prompt_token) in token_probs:
+                            prompt_logprobs_out.append(token_probs[str(prompt_token)]["logprob"])
+                        elif token_probs:
+                            # Fallback: take the first (highest prob) token's logprob
+                            first_key = next(iter(token_probs))
+                            prompt_logprobs_out.append(token_probs[first_key]["logprob"])
+                        else:
+                            prompt_logprobs_out.append(None)
+                    else:
+                        # Direct float value
+                        prompt_logprobs_out.append(float(token_probs))
+
+        return types.SampleOutput(sequences=sequences, prompt_logprobs=prompt_logprobs_out)
